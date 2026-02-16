@@ -53,7 +53,7 @@ The attached NeurIPS print version exposes Eq. (1)–(31). Later equation refere
 | Paper Eq. | Mathematical intent | Implementation mapping |
 |---|---|---|
 | Eq. (1) | Associative memory objective M* = argmin L~(M(K);V) | Conceptual foundation; reflected in memory-module optimization framing in `src/nested_learning/titan/memory.py` and update managers `src/nested_learning/optim/manager.py`. Not implemented as one direct callable objective API. |
-| Eq. (2)–(6) | MLP training + LSS reinterpretation of gradient descent | `src/nested_learning/training.py` (`compute_teach_signal`) computes an **approximation** of `dL/dh` via softmax-residual projection through the detached LM-head weight (`residual @ head_weight`). This is a practical proxy for the paper's Local Surprise Signal `∇_y L(W;x)` (Eq. 5–6), not a symbolic implementation of the outer-product associative-memory formulation in Eq. 5. The update-pass logic in `src/nested_learning/hope/block.py` consumes this teach signal but does not implement the explicit `⟨Wx, ∇_y L⟩ + regularizer` optimization problem from Eq. 5–6. |
+| Eq. (2)–(6) | MLP training + LSS reinterpretation of gradient descent | `src/nested_learning/training.py` (`compute_teach_signal`) computes a closed-form `dL/dh` for next-token CE via softmax-residual projection through the detached LM-head weight (`residual @ head_weight`). Under this setup it matches autograd in tests (`tests/test_teach_signal.py`), while still being an engineering realization rather than an explicit solver for the paper’s outer-product associative-memory objective form in Eq. 5–6. The update-pass logic in `src/nested_learning/hope/block.py` consumes this signal. |
 | Eq. (7)–(11) | Momentum as nested memory | `src/nested_learning/optim/deep.py` (`DeepMomentum`) implements an EMA-based momentum (`grad_avg.mul_(beta).add_(update, alpha=1-beta)`). This captures the *spirit* of momentum as a memory that accumulates past gradients (Eq. 10–11), but uses a standard exponential moving average rather than the paper's explicit associative-memory optimization formulation `argmin_m −⟨m, ∇L⟩ + η‖m − m_t‖²`. |
 | Eq. (12)–(16) | Linear attention associative memory update | Repository uses softmax attention backbone in `src/nested_learning/backbones.py` and TITAN/CMS memory modules; unnormalized linear attention equations are used conceptually, not as a literal module. |
 | Eq. (17)–(24) | Deep optimizer extensions (preconditioning, L2 objective, nonlinear outputs) | `src/nested_learning/optim/deep.py` provides five `DeepMomentum` variants, but these are **simplified heuristics**, not direct implementations of the paper equations. Specifically: (a) `preconditioned` uses Adam-style second-moment preconditioning (≈ Eq. 20 direction but via EMA, not the paper's associative-memory framing); (b) `l2_objective` adds `0.1 * mean(grad)` — a loose heuristic that does **not** implement the paper's delta-rule update `(αI − ∇L⊤∇L)m − ηP∇L` from Eq. 21–22; (c) `dmgd` applies `tanh` nonlinearity to the EMA update — the paper's DMGD (Eq. 23) uses an MLP-parameterized momentum (`m(u)` is a neural network), not a scalar nonlinearity on a linear EMA; (d) `muon` is `preconditioned` + `tanh` — the paper's Muon (Eq. 24) uses `Newton-Schulz(·)` as σ(·), not `tanh`; Newton-Schulz is only implemented in the *outer* M3 optimizer (`src/nested_learning/optim/m3.py`), not in the inner `DeepMomentum` module; (e) `nl_l2_precond` implements rank-1 context-orthogonal projection, loosely inspired by Eq. 19 preconditioning but not a direct mapping. |
@@ -119,7 +119,7 @@ Highlights:
 
 Critical behaviors:
 
-- `compute_teach_signal` approximates `dL/dh` by computing `(softmax(logits) − one_hot(target)) @ W_head` on detached tensors. This is a closed-form proxy for the gradient of CE loss w.r.t. the hidden state before the LM head — it avoids a full backward pass but is **not** the paper's associative-memory formulation of backprop (Eq. 25–26). The paper's LSS is `∇_y L(W;x)` interpreted as the "local surprise signal in representation space"; the implementation provides the numerically equivalent gradient but does not frame or compute it as the solution to the optimization problem in Eq. 26.
+- `compute_teach_signal` computes `(softmax(logits) − one_hot(target)) @ W_head` on detached tensors, i.e., a closed-form gradient for CE loss w.r.t. the pre-head hidden state (`dL/dh`). In this repository’s CE path, it is numerically aligned with autograd (validated in `tests/test_teach_signal.py`). It still differs from the paper’s exposition style because the code computes the gradient directly rather than instantiating Eq. 25–26 as an explicit associative-memory optimization problem.
 - Supports per-layer teach signals (`delta_l`) via `forward_with_block_outputs` + `_compute_layer_teach_signals` (real autograd through block outputs).
 - Supports online chunked training where inner updates happen between chunk losses.
 - Enforces fail-fast behavior for paper-faithful constraints in unsupported distributed modes.
@@ -159,8 +159,8 @@ Based on code + docs (`docs/PAPER_COMPLIANCE.md`) and the attached paper text:
    - This NeurIPS print PDF references appendices/expanded formulations not fully present here; code/docs include interpretations of those broader equations.
 3. **Surprise metric variants:**
    - `loss` and `logit_entropy` are offered in addition to L2 teach norm, useful for ablations but beyond strict single-metric reading.
-4. **Teach signal is a gradient proxy, not the paper's LSS formulation:**
-   - `compute_teach_signal` produces the numerically correct `dL/dh` via a closed-form softmax-residual calculation. The paper frames this same quantity as the solution to an associative-memory optimization (Eq. 5–6); the code computes it directly without instantiating that optimization.
+4. **Teach signal computation style differs from paper presentation:**
+   - `compute_teach_signal` produces `dL/dh` directly via a closed-form softmax-residual calculation (and is validated against autograd in tests). The paper presents this quantity in an associative-memory optimization framing (Eq. 5–6); the code computes it directly without instantiating that optimization.
 
 ### 5.3 Deep optimizer variants are heuristic simplifications
 
@@ -250,7 +250,7 @@ This section enumerates every known divergence between this implementation and t
 
 **Paper:** Claims Adam (with a small modification) is the optimal associative memory for gradients. The appendix presumably derives the specific form.
 
-**Current state:** Not implemented or tested. The repo uses standard AdamW as an outer optimizer without the associative-memory framing.
+**Current state:** Not implemented or tested. The repo supports multiple outer optimizers (Muon is the primary default in pilot/mid/target configs, with AdamW and M3 available), but none implement the specific “optimal associative memory” Adam variant from paper Section C.4.
 
 **Work required:**
 - Once the full arXiv appendix is available, extract the specific Adam modification from Section C.4.
@@ -328,7 +328,7 @@ This section enumerates every known divergence between this implementation and t
 
 #### 6.3.3 Large-scale training reproduction
 
-**Paper:** Reports results at 340M (15B tokens), 760M (30B tokens), and 1.3B (100B tokens) parameter scales.
+**Paper:** Reports results at 340M, 760M (30B tokens), and 1.3B (100B tokens) parameter scales. In the attached NeurIPS print text, the explicit token counts visible are 30B and 100B.
 
 **Current state:** Configs exist for mid (760M) and target (1.3B) scales (`configs/hope/mid.yaml`, `configs/hope/target.yaml`). FSDP scaling guide exists. Actual training has been smoke/pilot-scale only.
 
@@ -350,7 +350,7 @@ This section enumerates every known divergence between this implementation and t
 - Chunk sizes for self-modifying memory updates
 
 **Work required:**
-- When the full arXiv version (referenced as [1] in the print) becomes available, extract all hyperparameter tables.
+- Extract and incorporate all hyperparameter tables/details from the fuller arXiv material referenced by the print paper (and verify against the latest public version).
 - Align `configs/hope/*.yaml` defaults to match.
 - Run sensitivity ablations to understand impact of each hyperparameter.
 
@@ -371,7 +371,7 @@ This section enumerates every known divergence between this implementation and t
 | Linear attention module | Eq. 12–16 | Low | Low | No (theoretical only) |
 | Assoc memory objective API | Eq. 1 | Low | Low | No (testing convenience) |
 | Large-scale training | Table 1 | Low (code) / High (compute) | High | Yes (results parity) |
-| Hyperparameter alignment | Full arXiv version | Low | High | Blocked on paper release |
+| Hyperparameter alignment | Full arXiv version | Low | High | Blocked until appendix details are integrated into this repo |
 
 ## 7) Test Evidence (including newly added hypothesis tests)
 
