@@ -53,11 +53,11 @@ The attached NeurIPS print version exposes Eq. (1)–(31). Later equation refere
 | Paper Eq. | Mathematical intent | Implementation mapping |
 |---|---|---|
 | Eq. (1) | Associative memory objective M* = argmin L~(M(K);V) | Conceptual foundation; reflected in memory-module optimization framing in `src/nested_learning/titan/memory.py` and update managers `src/nested_learning/optim/manager.py`. Not implemented as one direct callable objective API. |
-| Eq. (2)–(6) | MLP training + LSS reinterpretation of gradient descent | `src/nested_learning/training.py` (`compute_teach_signal`) and update-pass logic in `src/nested_learning/hope/block.py` implement the LSS-style local teaching signal and updates. |
-| Eq. (7)–(11) | Momentum as nested memory | `src/nested_learning/optim/deep.py` (`DeepMomentum`) implements momentum-family inner memories and state. |
+| Eq. (2)–(6) | MLP training + LSS reinterpretation of gradient descent | `src/nested_learning/training.py` (`compute_teach_signal`) computes an **approximation** of `dL/dh` via softmax-residual projection through the detached LM-head weight (`residual @ head_weight`). This is a practical proxy for the paper's Local Surprise Signal `∇_y L(W;x)` (Eq. 5–6), not a symbolic implementation of the outer-product associative-memory formulation in Eq. 5. The update-pass logic in `src/nested_learning/hope/block.py` consumes this teach signal but does not implement the explicit `⟨Wx, ∇_y L⟩ + regularizer` optimization problem from Eq. 5–6. |
+| Eq. (7)–(11) | Momentum as nested memory | `src/nested_learning/optim/deep.py` (`DeepMomentum`) implements an EMA-based momentum (`grad_avg.mul_(beta).add_(update, alpha=1-beta)`). This captures the *spirit* of momentum as a memory that accumulates past gradients (Eq. 10–11), but uses a standard exponential moving average rather than the paper's explicit associative-memory optimization formulation `argmin_m −⟨m, ∇L⟩ + η‖m − m_t‖²`. |
 | Eq. (12)–(16) | Linear attention associative memory update | Repository uses softmax attention backbone in `src/nested_learning/backbones.py` and TITAN/CMS memory modules; unnormalized linear attention equations are used conceptually, not as a literal module. |
-| Eq. (17)–(24) | Deep optimizer extensions (preconditioning, L2 objective, nonlinear outputs) | `src/nested_learning/optim/deep.py` (variants: `preconditioned`, `l2_objective`, `nl_l2_precond`, `dmgd`, `muon`) and outer optimizer selection in `src/nested_learning/training.py`. |
-| Eq. (25)–(29) | Backprop as associative memory + L2-style variant | Teach-signal and chunk loss shaping in `src/nested_learning/training.py` + `_chunk_loss` in `src/nested_learning/hope/block.py` are the practical approximation path. |
+| Eq. (17)–(24) | Deep optimizer extensions (preconditioning, L2 objective, nonlinear outputs) | `src/nested_learning/optim/deep.py` provides five `DeepMomentum` variants, but these are **simplified heuristics**, not direct implementations of the paper equations. Specifically: (a) `preconditioned` uses Adam-style second-moment preconditioning (≈ Eq. 20 direction but via EMA, not the paper's associative-memory framing); (b) `l2_objective` adds `0.1 * mean(grad)` — a loose heuristic that does **not** implement the paper's delta-rule update `(αI − ∇L⊤∇L)m − ηP∇L` from Eq. 21–22; (c) `dmgd` applies `tanh` nonlinearity to the EMA update — the paper's DMGD (Eq. 23) uses an MLP-parameterized momentum (`m(u)` is a neural network), not a scalar nonlinearity on a linear EMA; (d) `muon` is `preconditioned` + `tanh` — the paper's Muon (Eq. 24) uses `Newton-Schulz(·)` as σ(·), not `tanh`; Newton-Schulz is only implemented in the *outer* M3 optimizer (`src/nested_learning/optim/m3.py`), not in the inner `DeepMomentum` module; (e) `nl_l2_precond` implements rank-1 context-orthogonal projection, loosely inspired by Eq. 19 preconditioning but not a direct mapping. |
+| Eq. (25)–(29) | Backprop as associative memory + L2-style variant | The paper proposes `W_{t+1} = W_t(I − x_t x_t⊤) − η∇L` (Eq. 28–29), a GD variant with an explicit outer-product projection that removes the component of W along the current input. The implementation does **not** implement this projection. Instead, `_chunk_loss` in `src/nested_learning/hope/block.py` constructs a standard MSE-style loss `‖pred − stopgrad(pred − δ)‖²` whose gradient w.r.t. prediction is proportional to the teach-signal δ, and `compute_teach_signal` in `training.py` provides the δ. This is a practical gradient-shaping construction that achieves δ-directed updates, but omits the `(I − x_t x_t⊤)` weight decay term that is central to Eq. 28–29. |
 | Eq. (30) | CMS chained MLP forward | Directly represented by `src/nested_learning/cms.py` (`CMS.forward`) and HOPE block compositions in `src/nested_learning/hope/block.py`. |
 | Eq. (31) | Per-level update periodicity C(l) | Enforced with `LevelSpec.update_period`, `LevelClock`, online chunk buffering, and level-manager stepping in `src/nested_learning/levels.py` and `src/nested_learning/hope/block.py`. |
 
@@ -68,10 +68,10 @@ The attached NeurIPS print version exposes Eq. (1)–(31). Later equation refere
 
 `src/nested_learning/model.py` defines `ModelConfig` and `HOPEModel` with four variants:
 
-- `hope_attention`: attention -> CMS
-- `hope_hybrid`: attention + TITAN memory + CMS
-- `hope_selfmod`: self-modifying Titans -> CMS
-- `transformer`: baseline attention -> MLP
+- `hope_attention`: attention -> CMS (paper-faithful minimal variant)
+- `hope_hybrid`: attention + TITAN memory + CMS (legacy/exploratory — uses `SelfModifier` hypernetwork from `hope/self_mod.py`, not the paper's self-modifying Titans)
+- `hope_selfmod`: self-modifying Titans -> CMS (paper-faithful primary variant)
+- `transformer`: baseline attention -> MLP (comparison baseline)
 
 Key implementation details:
 
@@ -119,8 +119,8 @@ Highlights:
 
 Critical behaviors:
 
-- `compute_teach_signal` approximates `dL/dh` from LM logits/targets.
-- Supports per-layer teach signals (`delta_l`) via `forward_with_block_outputs`.
+- `compute_teach_signal` approximates `dL/dh` by computing `(softmax(logits) − one_hot(target)) @ W_head` on detached tensors. This is a closed-form proxy for the gradient of CE loss w.r.t. the hidden state before the LM head — it avoids a full backward pass but is **not** the paper's associative-memory formulation of backprop (Eq. 25–26). The paper's LSS is `∇_y L(W;x)` interpreted as the "local surprise signal in representation space"; the implementation provides the numerically equivalent gradient but does not frame or compute it as the solution to the optimization problem in Eq. 26.
+- Supports per-layer teach signals (`delta_l`) via `forward_with_block_outputs` + `_compute_layer_teach_signals` (real autograd through block outputs).
 - Supports online chunked training where inner updates happen between chunk losses.
 - Enforces fail-fast behavior for paper-faithful constraints in unsupported distributed modes.
 - Supports AdamW / Muon hybrid / M3 outer optimizer choices.
@@ -153,23 +153,227 @@ Based on code + docs (`docs/PAPER_COMPLIANCE.md`) and the attached paper text:
 
 ### 5.2 Ambiguities or pragmatic approximations
 
-1. Paper objective details vs implementation objective shaping:
-   - CMS and memory updates use practical losses (`_chunk_loss`, MSE-style constructs) that are faithful in direction but are engineering realizations, not one-to-one symbolic forms for every paper equation.
-2. Print paper is condensed:
+1. **Paper objective details vs implementation objective shaping:**
+   - CMS and memory updates use practical losses (`_chunk_loss`, MSE-style constructs) that are faithful in gradient direction but are engineering realizations, not one-to-one symbolic forms for every paper equation.
+2. **Print paper is condensed:**
    - This NeurIPS print PDF references appendices/expanded formulations not fully present here; code/docs include interpretations of those broader equations.
-3. Surprise metric variants:
+3. **Surprise metric variants:**
    - `loss` and `logit_entropy` are offered in addition to L2 teach norm, useful for ablations but beyond strict single-metric reading.
+4. **Teach signal is a gradient proxy, not the paper's LSS formulation:**
+   - `compute_teach_signal` produces the numerically correct `dL/dh` via a closed-form softmax-residual calculation. The paper frames this same quantity as the solution to an associative-memory optimization (Eq. 5–6); the code computes it directly without instantiating that optimization.
 
-### 5.3 Not fully built out relative to strict paper-faithful large-scale path
+### 5.3 Deep optimizer variants are heuristic simplifications
+
+The `DeepMomentum` variants in `src/nested_learning/optim/deep.py` are the **largest divergence** between the implementation and the paper's mathematical formulations (Eq. 17–24). Specifically:
+
+1. **No MLP-parameterized momentum (Eq. 23 DMGD):** The paper defines DMGD with momentum as a multi-layer neural network `m(u)` whose parameters are updated by an inner objective. The implementation uses a scalar EMA with `tanh` nonlinearity — structurally different from a learned MLP momentum.
+2. **No delta-rule momentum update (Eq. 21–22):** The paper's L2-objective extension produces `m_{i+1} = (αI − ∇L⊤∇L)m − ηP∇L`, a Widrow-Hoff / delta-rule that allows the momentum to manage capacity by subtracting previously stored gradient directions. The `l2_objective` variant adds `0.1 * mean(grad)` — a fixed heuristic unrelated to this formula.
+3. **Muon nonlinearity mismatch (Eq. 24):** The paper specifies `σ(·) = Newton-Schulz(·)` for the Muon optimizer. `DeepMomentum(variant="muon")` uses `tanh`. Newton-Schulz orthogonalization is only present in the outer `M3` optimizer (`optim/m3.py`), not in the inner momentum module.
+4. **Preconditioning is Adam-style, not associative (Eq. 19–20):** The paper frames preconditioning as the momentum learning a mapping between a value matrix P and gradients. The `preconditioned` variant uses standard Adam second-moment EMA (`v = β₂v + (1−β₂)g²; g/√v`), which achieves diagonal preconditioning but not the key-value associative memory framing.
+
+These variants are useful engineering baselines and correctly labeled in code, but should not be cited as direct implementations of Eq. 17–24.
+
+### 5.4 Not fully built out relative to strict paper-faithful large-scale path
 
 1. Full bi-level meta-learning experiments over explicit task episodes are not present.
 2. No backprop-through-online-writes boundary-state training procedure; writes are stop-grad explicit passes.
 3. Distributed paper-faithful parity is intentionally limited:
    - DDP disables/guards some online + per-layer mechanisms,
    - FSDP path is practical/offline-oriented.
-4. Large-scale benchmark parity (paper-scale compute/data) is not guaranteed by this repo alone.
+4. Large-scale benchmark parity (paper-scale compute/data) is not guaranteed by this repo alone. The paper reports results at 340M / 760M / 1.3B parameters trained on 30B–100B tokens; this repo has run smoke and pilot-scale experiments, not full-scale reproduction runs.
+5. **Undiscussed files:** `src/nested_learning/titan/model.py` (364 lines) defines a standalone `TitanOnlyModel` — an older/alternative architecture variant not referenced in the main HOPE pipeline. `src/nested_learning/hope/self_mod.py` (41 lines) defines a `SelfModifier` hypernetwork (concatenates key+value+error → MLP → delta) used only by the legacy `HOPEBlock` hybrid variant, not by the paper-faithful `HOPESelfModBlock`.
+6. **Hyperparameter correspondence is unverified:** The paper does not publish all hyperparameters (eta_scale, chunk sizes, surprise thresholds, CMS level periods). The repo's defaults are reasonable engineering choices; whether they match the paper's internal configurations is unknown.
 
-## 6) Test Evidence (including newly added hypothesis tests)
+## 6) Gap-to-Paper Roadmap: What Needs to Be Done to Match the Exact Paper
+
+This section enumerates every known divergence between this implementation and the paper's mathematical formulations, ordered by estimated impact on reproducing the paper's results.
+
+### 6.1 High impact — likely required for paper-scale results
+
+#### 6.1.1 Implement MLP-parameterized deep momentum (Eq. 23–24, DMGD)
+
+**Paper:** Momentum `m` is a multi-layer neural network. The inner objective `L^(2)(m; u, I)` (e.g., dot-product similarity `⟨m(u⊤), 1⟩`) is optimized w.r.t. the MLP parameters of `m`. The weight update becomes `W_{i+1} = W_i + σ(m_{i+1}(u_i))`, where σ can be Newton-Schulz orthogonalization.
+
+**Current state:** `DeepMomentum` uses a scalar EMA (`grad_avg = β·grad_avg + (1−β)·update`) with optional `tanh` nonlinearity. No MLP, no inner objective optimization, no Newton-Schulz on the momentum output.
+
+**Work required:**
+- Replace `DeepMomentum`'s linear EMA state with a small MLP (e.g., 2-layer residual, matching `ResidualMLPMemory` architecture).
+- Add an inner optimization step: compute `∇_{m_params} L^(2)(m; u, I)` and apply it to the MLP's parameters each outer step.
+- Add Newton-Schulz as a σ option on the momentum output (can reuse `_newton_schulz` from `m3.py`).
+- Expose variant selection: `dmgd_mlp`, `muon_ns` alongside existing heuristic variants.
+
+**Files:** `src/nested_learning/optim/deep.py`, new inner-loop logic.
+
+#### 6.1.2 Implement delta-rule momentum update (Eq. 21–22)
+
+**Paper:** `m_{i+1} = (α_{i+1}I − ∇L(W_i;x_i)⊤ ∇L(W_i;x_i)) m_i − η_t P_i ∇L(W_i;x_i)`. The `−∇L⊤∇L · m` term is a Widrow-Hoff correction that subtracts previously stored gradient directions from momentum, enabling better capacity management.
+
+**Current state:** The `l2_objective` variant adds `0.1 * mean(grad)` — unrelated to the delta rule.
+
+**Work required:**
+- Implement: `m_new = (α·I − g⊤g) · m_old − η · P · g` where `g = ∇L(W;x)`.
+- For the preconditioning matrix P, support at minimum: identity (→ Eq. 22 without preconditioning) and second-moment diagonal (→ Adam-style).
+- This is a matrix-vector operation per parameter tensor; compute cost is modest.
+
+**Files:** `src/nested_learning/optim/deep.py` (new variant `delta_rule`).
+
+#### 6.1.3 Implement the L2-variant of gradient descent (Eq. 28–29)
+
+**Paper:** `W_{t+1} = W_t(I − x_t x_t⊤) − η ∇_y L ⊗ x_t`. The `W_t(I − x_t x_t⊤)` term is a rank-1 weight decay that removes the component of W projecting onto the current input, making the update aware of input dependencies.
+
+**Current state:** The inner update uses standard MSE-style `_chunk_loss` with teach-signal-shaped targets. No `(I − x_t x_t⊤)` projection is applied.
+
+**Work required:**
+- In the CMS / memory update path, after computing the gradient update, apply the additional weight modification: `W = W @ (I − x x⊤ / ‖x‖²)` (or the batched equivalent over chunk tokens).
+- This can be implemented as a post-step hook in `LevelOptimizerManager.apply_grads()` or directly in `_update_cms_chunk`.
+- Note: the paper says "we use this optimizer as the internal optimizer of our HOPE architecture" (after Eq. 29), so this is specifically intended for the CMS inner updates.
+
+**Files:** `src/nested_learning/hope/block.py` (`_update_cms_chunk`), `src/nested_learning/optim/manager.py`.
+
+#### 6.1.4 Backpropagation through online writes (boundary-state gradients)
+
+**Paper:** Implies a chunk-parallel training procedure where the outer loss gradient flows *through* the online memory updates (boundary states between chunks are differentiable).
+
+**Current state:** All online writes use `torch.no_grad()` / `.detach()`. The `PAPER_COMPLIANCE.md` explicitly documents this as a known semantic gap.
+
+**Work required:**
+- Make the CMS delta updates differentiable: instead of `stop_grad(delta)`, allow gradients to flow from later chunk losses back through the CMS parameter updates of earlier chunks.
+- For self-modifying Titans: make `_apply_chunk_update_seq` differentiable (currently uses `vmap(grad(...))` in a stop-grad context).
+- This is architecturally the hardest item — it requires careful memory management (gradient checkpointing through the update chain) and may need `torch.utils.checkpoint` per chunk.
+- Validate: the outer loss gradient w.r.t. meta-parameters should now include terms from the online update pathway, not just the read pathway.
+
+**Files:** `src/nested_learning/hope/block.py` (all `_update_*` methods), `src/nested_learning/titan/self_modifying.py` (`_apply_chunk_update_seq`), `src/nested_learning/training.py` (online chunk loop).
+
+### 6.2 Medium impact — improves fidelity for specific experiments
+
+#### 6.2.1 Adam as optimal associative memory (Paper Section C.4)
+
+**Paper:** Claims Adam (with a small modification) is the optimal associative memory for gradients. The appendix presumably derives the specific form.
+
+**Current state:** Not implemented or tested. The repo uses standard AdamW as an outer optimizer without the associative-memory framing.
+
+**Work required:**
+- Once the full arXiv appendix is available, extract the specific Adam modification from Section C.4.
+- Implement as a variant of the outer optimizer or as an alternative inner memory update rule.
+- Compare against standard AdamW in ablations.
+
+**Files:** `src/nested_learning/optim/` (new module or variant).
+
+#### 6.2.2 Preconditioning as associative key-value mapping (Eq. 19–20)
+
+**Paper:** The momentum `m` maps gradients (keys) to preconditioning values P_i (values). The paper argues that functions of the Hessian provide the most meaningful P_i.
+
+**Current state:** `preconditioned` uses diagonal Adam-style second-moment. `nl_l2_precond` projects gradients orthogonal to a context vector. Neither frames P as a key-value mapping or uses Hessian information.
+
+**Work required:**
+- Implement a variant where P_i is derived from curvature information (e.g., diagonal Fisher, or Hessian-vector products via `torch.autograd.functional.hvp`).
+- Frame the preconditioning step as key-value storage: gradient → Hessian-informed direction.
+- This is expensive at scale; consider low-rank Hessian approximations (e.g., K-FAC style).
+
+**Files:** `src/nested_learning/optim/deep.py` (new variant).
+
+#### 6.2.3 Full self-referential learning loop
+
+**Paper (abstract):** HOPE "learns how to modify itself by learning its own update algorithm." The self-modifying Titans learn eta/alpha gates that control the update, but the *update rule structure itself* (DGD-like gradient descent on the memory) is fixed.
+
+**Current state:** The learned eta/alpha gates provide input-dependent learning rates and retention, which is a form of learned update control. But the update rule template (`w_new = alpha·w − eta·P·grad`) is hardcoded, not itself learned.
+
+**Work required:**
+- To fully match the paper's vision: the update rule itself should be parameterizable and meta-learned.
+- Possible approach: replace the fixed DGD template with a small hypernetwork that takes (current_state, gradient, input) and outputs the full parameter delta.
+- Note: The existing `SelfModifier` in `hope/self_mod.py` (concatenates key+value+error → MLP → delta) is closer to this idea but is only used in the legacy `HOPEBlock`, not the paper-faithful `HOPESelfModBlock`.
+
+**Files:** `src/nested_learning/titan/self_modifying.py`, possibly integrate `hope/self_mod.py` pattern.
+
+#### 6.2.4 Bi-level meta-learning evaluation (task-episode format)
+
+**Paper:** Discusses models that can "continually learn" and "fast adapt to a new task." The NL framework supports explicit inner/outer task structure.
+
+**Current state:** Training uses standard language modeling (next-token prediction). No task-episode evaluation where the model adapts to a new task distribution within context and is evaluated on held-out queries.
+
+**Work required:**
+- Implement a few-shot evaluation harness: sample task → provide k-shot context → evaluate on held-out examples → measure adaptation quality.
+- Add continual-learning benchmarks with explicit domain-shift boundaries (partially started in `scripts/eval/continual.py` and `continual_classification.py`).
+- This is primarily an evaluation/experiment concern, not an architecture change.
+
+**Files:** `scripts/eval/` (new evaluation scripts), configs for task-episode data.
+
+### 6.3 Lower impact — completeness and rigor
+
+#### 6.3.1 Linear attention as associative memory module (Eq. 12–16)
+
+**Paper:** Uses unnormalized linear attention to demonstrate that the recurrence `M_{t+1} = M_t + v_t k_t⊤` is equivalent to one step of gradient descent on an associative memory objective (Eq. 15–16).
+
+**Current state:** The repo uses softmax attention (standard `F.scaled_dot_product_attention`). Linear attention is used only as theoretical scaffolding in the paper.
+
+**Work required (optional):**
+- Implement an unnormalized linear attention module matching Eq. 13–14.
+- Use it to validate the associative-memory equivalence claim (Eq. 15–16) via unit tests.
+- Not required for HOPE results, but would complete the NL framework demonstration.
+
+**Files:** New module in `src/nested_learning/backbones.py` or `src/nested_learning/linear_attention.py`.
+
+#### 6.3.2 Expose the Eq. 1 associative memory objective as a callable API
+
+**Paper:** Definition 1 is the foundation — `M* = argmin L̃(M(K); V)`. All other formulations derive from specific choices of L̃ and optimization method.
+
+**Current state:** `AssocMemory` protocol has `forward()` and `update()` but no explicit `objective()` method. The associative memory formulation is implicit in the update rules.
+
+**Work required:**
+- Add an `objective(keys, values) → loss` method to the `AssocMemory` protocol.
+- Each memory type computes its specific L̃ (dot-product, L2, etc.).
+- Enables direct testing of the associative memory equivalence claims.
+
+**Files:** `src/nested_learning/assoc_memory.py`, implementors (`titan/memory.py`, `titan/self_modifying.py`, `cms.py`).
+
+#### 6.3.3 Large-scale training reproduction
+
+**Paper:** Reports results at 340M (15B tokens), 760M (30B tokens), and 1.3B (100B tokens) parameter scales.
+
+**Current state:** Configs exist for mid (760M) and target (1.3B) scales (`configs/hope/mid.yaml`, `configs/hope/target.yaml`). FSDP scaling guide exists. Actual training has been smoke/pilot-scale only.
+
+**Work required:**
+- Compute budget: dual RTX 6000 Ada (2×48GB) is documented but may be insufficient for 100B-token 1.3B runs without significant wall-clock time.
+- Run full training at each scale with paper-matched hyperparameters (where known).
+- Evaluate on the paper's benchmark suite (WikiText, LMB, PIQA, HellaSwag, WinoGrande, ARC, SIQA, BoolQ).
+- Compare against the paper's Table 1 numbers.
+
+**Files:** `configs/hope/target.yaml`, `scripts/eval/zeroshot.py`, `docs/compute_plan.md`.
+
+#### 6.3.4 Hyperparameter alignment with paper
+
+**Paper:** Does not publish all internal hyperparameters. Key unknowns include:
+- Exact eta_scale values for self-modifying memories
+- CMS level update periods and how they scale with model size
+- Surprise threshold values used during training
+- Inner optimizer learning rates for CMS and TITAN updates
+- Chunk sizes for self-modifying memory updates
+
+**Work required:**
+- When the full arXiv version (referenced as [1] in the print) becomes available, extract all hyperparameter tables.
+- Align `configs/hope/*.yaml` defaults to match.
+- Run sensitivity ablations to understand impact of each hyperparameter.
+
+**Files:** `configs/hope/*.yaml`, `docs/` (new hyperparameter alignment doc).
+
+### 6.4 Summary matrix
+
+| Gap | Paper Reference | Difficulty | Impact | Blocking for paper parity? |
+|---|---|---|---|---|
+| MLP deep momentum (DMGD) | Eq. 23–24 | Medium | High | Yes (optimizer expressivity) |
+| Delta-rule momentum | Eq. 21–22 | Low | Medium–High | Yes (capacity management) |
+| L2-variant GD for CMS | Eq. 28–29 | Low–Medium | High | Yes (paper says HOPE uses this) |
+| Backprop through online writes | Implicit in training procedure | High | High | Yes (gradient flow fidelity) |
+| Adam as optimal assoc. memory | Section C.4 | Unknown | Medium | Needs appendix |
+| Hessian-based preconditioning | Eq. 19–20 | Medium–High | Medium | No (ablation target) |
+| Full self-referential update learning | Abstract / Section 3 | High | Medium | No (eta/alpha gates are partial) |
+| Bi-level meta-learning eval | Paper discussion | Medium | Medium | No (eval only) |
+| Linear attention module | Eq. 12–16 | Low | Low | No (theoretical only) |
+| Assoc memory objective API | Eq. 1 | Low | Low | No (testing convenience) |
+| Large-scale training | Table 1 | Low (code) / High (compute) | High | Yes (results parity) |
+| Hyperparameter alignment | Full arXiv version | Low | High | Blocked on paper release |
+
+## 7) Test Evidence (including newly added hypothesis tests)
 
 New tests added in this task:
 
@@ -195,7 +399,7 @@ Interpretation:
 - Tiny online training path with inferred chunk-size clamping was exercised and produced finite metrics with nonzero teach/update telemetry.
 - Core mathematical invariants (teach signal, CMS behavior, optimizer update flow) remain green in targeted suite.
 
-## 7) Markdown File Summaries
+## 8) Markdown File Summaries
 
 - `CHANGELOG.md`: **Changelog**. All notable changes to this project will be documented here. The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic versioning once tagged releases begin.
 - `README.md`: **Nested Learning Reproduction**. ![Python](https://img.shields.io/badge/python-3.12+-blue)
@@ -232,7 +436,7 @@ Interpretation:
 - `reports/stage2_smoke.md`: **Stage 2 Smoke Artifact Summary**. - 2× NVIDIA RTX 6000 Ada (49 GB VRAM each)
 
 
-## 8) Functional File Index (included verbatim below)
+## 9) Functional File Index (included verbatim below)
 
 | File | Role | Lines |
 |---|---|---|
@@ -385,7 +589,7 @@ Interpretation:
 | `train_fsdp.py` | training entrypoint | 200 |
 
 
-## 9) Verbatim Functional Code Appendix
+## 10) Verbatim Functional Code Appendix
 
 The following sections print each functional code file exactly as present at generation time.
 
