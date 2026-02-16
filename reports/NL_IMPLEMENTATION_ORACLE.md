@@ -162,18 +162,15 @@ Based on code + docs (`docs/PAPER_COMPLIANCE.md`) and the attached paper text:
 4. **Teach signal computation style differs from paper presentation:**
    - `compute_teach_signal` produces `dL/dh` directly via a closed-form softmax-residual calculation (and is validated against autograd in tests). The paper presents this quantity in an associative-memory optimization framing (Eq. 5–6); the code computes it directly without instantiating that optimization.
 
-### 5.3 Deep optimizer variants are heuristic simplifications
+5. **Deep optimizer variants are heuristic simplifications:**
+   - The `DeepMomentum` variants in `src/nested_learning/optim/deep.py` are the **largest divergence** between the implementation and the paper's mathematical formulations (Eq. 17–24). Specifically:
+     1. **No MLP-parameterized momentum (Eq. 23 DMGD):** The paper defines DMGD with momentum as a multi-layer neural network `m(u)` whose parameters are updated by an inner objective. The implementation uses a scalar EMA with `tanh` nonlinearity — structurally different from a learned MLP momentum.
+     2. **No delta-rule momentum update (Eq. 21–22):** The paper's L2-objective extension produces `m_{i+1} = (αI − ∇L⊤∇L)m − ηP∇L`, a Widrow-Hoff / delta-rule that allows the momentum to manage capacity by subtracting previously stored gradient directions. The `l2_objective` variant adds `0.1 * mean(grad)` — a fixed heuristic unrelated to this formula.
+     3. **Muon nonlinearity mismatch (Eq. 24):** The paper specifies `σ(·) = Newton-Schulz(·)` for the Muon optimizer. `DeepMomentum(variant="muon")` uses `tanh`. Newton-Schulz orthogonalization is only present in the outer `M3` optimizer (`optim/m3.py`), not in the inner momentum module.
+     4. **Preconditioning is Adam-style, not associative (Eq. 19–20):** The paper frames preconditioning as the momentum learning a mapping between a value matrix P and gradients. The `preconditioned` variant uses standard Adam second-moment EMA (`v = β₂v + (1−β₂)g²; g/√v`), which achieves diagonal preconditioning but not the key-value associative memory framing.
+   - These variants are useful engineering baselines and correctly labeled in code, but should not be cited as direct implementations of Eq. 17–24.
 
-The `DeepMomentum` variants in `src/nested_learning/optim/deep.py` are the **largest divergence** between the implementation and the paper's mathematical formulations (Eq. 17–24). Specifically:
-
-1. **No MLP-parameterized momentum (Eq. 23 DMGD):** The paper defines DMGD with momentum as a multi-layer neural network `m(u)` whose parameters are updated by an inner objective. The implementation uses a scalar EMA with `tanh` nonlinearity — structurally different from a learned MLP momentum.
-2. **No delta-rule momentum update (Eq. 21–22):** The paper's L2-objective extension produces `m_{i+1} = (αI − ∇L⊤∇L)m − ηP∇L`, a Widrow-Hoff / delta-rule that allows the momentum to manage capacity by subtracting previously stored gradient directions. The `l2_objective` variant adds `0.1 * mean(grad)` — a fixed heuristic unrelated to this formula.
-3. **Muon nonlinearity mismatch (Eq. 24):** The paper specifies `σ(·) = Newton-Schulz(·)` for the Muon optimizer. `DeepMomentum(variant="muon")` uses `tanh`. Newton-Schulz orthogonalization is only present in the outer `M3` optimizer (`optim/m3.py`), not in the inner momentum module.
-4. **Preconditioning is Adam-style, not associative (Eq. 19–20):** The paper frames preconditioning as the momentum learning a mapping between a value matrix P and gradients. The `preconditioned` variant uses standard Adam second-moment EMA (`v = β₂v + (1−β₂)g²; g/√v`), which achieves diagonal preconditioning but not the key-value associative memory framing.
-
-These variants are useful engineering baselines and correctly labeled in code, but should not be cited as direct implementations of Eq. 17–24.
-
-### 5.4 Not fully built out relative to strict paper-faithful large-scale path
+### 5.3 Not fully built out relative to strict paper-faithful large-scale path
 
 1. Full bi-level meta-learning experiments over explicit task episodes are not present.
 2. No backprop-through-online-writes boundary-state training procedure; writes are stop-grad explicit passes.
@@ -328,7 +325,7 @@ This section enumerates every known divergence between this implementation and t
 
 #### 6.3.3 Large-scale training reproduction
 
-**Paper:** Reports results at 340M, 760M (30B tokens), and 1.3B (100B tokens) parameter scales. In the attached NeurIPS print text, the explicit token counts visible are 30B and 100B.
+**Paper:** Reports results at 340M, 760M (30B tokens), and 1.3B (100B tokens) parameter scales. The print Table 1 only shows explicit token counts for the 760M and 1.3B sections; the 340M token budget is not stated in the print and may appear in the appendix.
 
 **Current state:** Configs exist for mid (760M) and target (1.3B) scales (`configs/hope/mid.yaml`, `configs/hope/target.yaml`). FSDP scaling guide exists. Actual training has been smoke/pilot-scale only.
 
