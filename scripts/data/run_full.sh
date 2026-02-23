@@ -27,17 +27,18 @@ filter_dataset() {
   local lang_threshold=${9:-0.85}
   local min_chars=${10:-200}
   local max_chars=${11:-12000}
+  local dataset_fallbacks=${12:-}
 
   if [[ "${FORCE_FILTER}" != "1" && -f "${output}" ]]; then
     echo "[Data][${name}] Found existing ${output}, skipping filter step (set FORCE_FILTER=1 to rebuild)"
     return
   fi
 
-  echo "[Data][${name}] Filtering ${dataset}${subset:+/${subset}} -> ${output}"
   run_filter() {
-    local split_value=$1
-    cmd=(uv run python scripts/data/filter_corpus.py
-      --dataset "${dataset}"
+    local dataset_value=$1
+    local split_value=$2
+    local cmd=(uv run python scripts/data/filter_corpus.py
+      --dataset "${dataset_value}"
       --split "${split_value}"
       --text-column "${text_column}"
       --target-lang "${target_lang}"
@@ -55,14 +56,34 @@ filter_dataset() {
     "${cmd[@]}"
   }
 
-  if ! run_filter "${split}"; then
-    if [[ -n "${FALLBACK_SPLIT}" && "${FALLBACK_SPLIT}" != "${split}" ]]; then
-      echo "[Data][${name}] Primary split '${split}' failed; retrying with fallback '${FALLBACK_SPLIT}'"
-      run_filter "${FALLBACK_SPLIT}"
-    else
-      exit 1
-    fi
+  local dataset_sources=("${dataset}")
+  if [[ -n "${dataset_fallbacks}" ]]; then
+    IFS=',' read -r -a _fallback_array <<< "${dataset_fallbacks}"
+    for _fallback in "${_fallback_array[@]}"; do
+      _fallback="${_fallback//[[:space:]]/}"
+      [[ -n "${_fallback}" ]] && dataset_sources+=("${_fallback}")
+    done
   fi
+
+  for dataset_value in "${dataset_sources[@]}"; do
+    echo "[Data][${name}] Filtering ${dataset_value}${subset:+/${subset}} -> ${output}"
+    rm -f "${output}"
+    if run_filter "${dataset_value}" "${split}"; then
+      return
+    fi
+    if [[ -n "${FALLBACK_SPLIT}" && "${FALLBACK_SPLIT}" != "${split}" ]]; then
+      echo "[Data][${name}] Split '${split}' failed for ${dataset_value}; retrying '${FALLBACK_SPLIT}'"
+      rm -f "${output}"
+      if run_filter "${dataset_value}" "${FALLBACK_SPLIT}"; then
+        return
+      fi
+    fi
+    echo "[Data][${name}] Dataset candidate failed: ${dataset_value}"
+  done
+
+  echo "[Data][${name}] ERROR: all dataset candidates failed"
+  echo "[Data][${name}] Tried: ${dataset_sources[*]}"
+  exit 1
 }
 
 echo "[Data] === Stage 1: Filtering corpora ==="
@@ -112,7 +133,8 @@ filter_dataset "redpajama" \
   "${RPJ_LANG:-en}" \
   "${RPJ_LANG_THRESHOLD:-0.85}" \
   "${RPJ_MIN_CHARS:-200}" \
-  "${RPJ_MAX_CHARS:-8000}"
+  "${RPJ_MAX_CHARS:-8000}" \
+  "${RPJ_DATASET_CANDIDATES:-MBZUAI-LLM/SlimPajama-627B-DC,DKYoon/SlimPajama-6B,gmongaras/SlimPajama-627B_Reupload}"
 
 filter_dataset "code" \
   "${CODE_DATASET:-codeparrot/codeparrot-clean-train}" \

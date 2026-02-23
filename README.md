@@ -92,6 +92,8 @@ Developer checks:
   # 1.3B run
   torchrun --nproc_per_node=2 train_fsdp.py --config-name hope/target_fsdp
   ```
+- RunPod operational workflow (pod setup, sync, resume drill):
+  - `docs/runpod_execution.md`
 - DeepSpeed (requires `deepspeed` installed separately):
   ```bash
   deepspeed --num_gpus=2 train_deepspeed.py --config-name target \
@@ -106,6 +108,8 @@ Use the paper-faithful preset configs (single GPU):
 uv run python train.py --config-name pilot_paper_faithful
 # HOPE self-mod variant:
 uv run python train.py --config-name pilot_selfmod_paper_faithful
+# HOPE attention-only variant:
+uv run python train.py --config-name pilot_attention_paper_faithful
 ```
 
 Notes:
@@ -116,6 +120,12 @@ Overrides:
 - `train.steps=...` / `train.device=...`
 
 See `docs/PAPER_COMPLIANCE.md` for full fidelity notes.
+
+Phase-0 canonical baseline orchestration (train + eval + bundle/checksums):
+
+```bash
+bash scripts/compute/run_phase0_baselines.sh
+```
 
 ### Pilot (3 B tokens) workflow
 1. Ensure TMUX session:

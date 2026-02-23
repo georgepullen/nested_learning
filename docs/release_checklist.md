@@ -7,6 +7,7 @@ Use this list before tagging/publishing any checkpoint bundle.
 - [ ] Inner optimizer variant (`nl_l2_precond`) enabled in configs
 - [ ] Teach-signal log shows finite norms across recent steps
 - [ ] CMS chunk telemetry confirms expected update cadence
+- [ ] For RunPod jobs: `bash scripts/compute/runpod_resume_drill.sh` completed at least once on the active pod image
 - [ ] `bash scripts/run_cpu_ddp_smoke.sh` (CPU DDP determinism)
 - [ ] `bash scripts/tests/run_passkey_smoke.sh` (synthetic memorization)
 
@@ -28,6 +29,7 @@ Use this list before tagging/publishing any checkpoint bundle.
 - [ ] W&B run link recorded in report
 - [ ] Local JSON logs copied to `logs/`
 - [ ] Memorizations stats (surprise counts, Titan/CMS updates) summarized
+- [ ] `uv run python scripts/checks/validate_fidelity_telemetry.py --log <metrics.json>` passes for every release run log
 
 ## Distribution
 - [ ] README references any new scripts/configs

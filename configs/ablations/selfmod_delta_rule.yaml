@@ -1,0 +1,41 @@
+defaults:
+  - /pilot
+  - _self_
+
+model:
+  block_variant: hope_selfmod
+  optimizers:
+    titan_opt:
+      type: deep_momentum
+      lr: 6.0e-4
+      params:
+        beta: 0.9
+        beta2: 0.999
+        variant: delta_rule
+        delta_eta: 1.0
+        delta_preconditioner: adam_diag
+    cms_opt:
+      type: deep_momentum
+      lr: 3.0e-4
+      params:
+        beta: 0.9
+        beta2: 0.999
+        variant: delta_rule
+        delta_eta: 1.0
+        delta_preconditioner: identity
+
+train:
+  online_updates: true
+  online_chunk_size: 0
+  per_layer_teach_signal: true
+  steps: 5000
+  device: "cuda:1"
+  checkpoint:
+    dir: artifacts/checkpoints/pilot_selfmod_delta_rule
+    save_interval: 1000
+
+logging:
+  enabled: true
+  backend: json
+  path: logs/pilot_selfmod_delta_rule_metrics.json
+  run_name: pilot-selfmod-delta-rule

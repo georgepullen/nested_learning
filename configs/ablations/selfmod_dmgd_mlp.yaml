@@ -1,0 +1,43 @@
+defaults:
+  - /pilot
+  - _self_
+
+model:
+  block_variant: hope_selfmod
+  optimizers:
+    titan_opt:
+      type: deep_momentum
+      lr: 6.0e-4
+      params:
+        beta: 0.9
+        beta2: 0.999
+        variant: dmgd_mlp
+        dmgd_hidden_dim: 16
+        dmgd_inner_lr: 1.0e-3
+        dmgd_inner_objective: mse
+    cms_opt:
+      type: deep_momentum
+      lr: 3.0e-4
+      params:
+        beta: 0.9
+        beta2: 0.999
+        variant: dmgd_mlp
+        dmgd_hidden_dim: 16
+        dmgd_inner_lr: 1.0e-3
+        dmgd_inner_objective: mse
+
+train:
+  online_updates: true
+  online_chunk_size: 0
+  per_layer_teach_signal: true
+  steps: 5000
+  device: "cuda:1"
+  checkpoint:
+    dir: artifacts/checkpoints/pilot_selfmod_dmgd_mlp
+    save_interval: 1000
+
+logging:
+  enabled: true
+  backend: json
+  path: logs/pilot_selfmod_dmgd_mlp_metrics.json
+  run_name: pilot-selfmod-dmgd-mlp

@@ -1,0 +1,14 @@
+defaults:
+  - /pilot_paper_faithful
+  - _self_
+
+model:
+  block_variant: hope_attention
+
+train:
+  checkpoint:
+    dir: artifacts/checkpoints/pilot_attention_paper_faithful
+
+logging:
+  run_name: pilot-attention-paper-faithful
+  path: logs/pilot_attention_paper_faithful_metrics.json

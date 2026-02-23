@@ -1,0 +1,16 @@
+[
+  {
+    "step": -1,
+    "model.surprise_metric": "loss",
+    "model.surprise_threshold": 0.05
+  },
+  {
+    "step": 0,
+    "loss": 5.9,
+    "ppl": 365.2,
+    "teach_signal_norm": 0.028,
+    "layer0.cms.cms_fast.grad_norm": 0.55,
+    "layer0.cms.cms_fast.chunk_tokens": 8.0,
+    "layer0.cms.cms_fast.gate_hit": 1.0
+  }
+]

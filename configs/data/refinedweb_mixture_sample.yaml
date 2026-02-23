@@ -32,7 +32,7 @@ datasets:
     output_dir: data/shards/c4_sample
     max_records: 4000
   - name: redpajama
-    dataset: cerebras/SlimPajama-627B
+    dataset: MBZUAI-LLM/SlimPajama-627B-DC
     split: train
     text_column: text
     sample_limit: 2000

@@ -84,7 +84,7 @@ This separation is intentional: **training chunking** is about “when can later
 
 ## 4. Quickstart Workflow
 1. **Install deps:** `uv sync --all-extras`
-2. **Sample data:** `uv run bash scripts/data/run_sample.sh` (downloads + filters RefinedWeb/Wiki/C4/SlimPajama/code samples, trains the tokenizer if missing, shards them, records stats in `data/mixtures/refinedweb_mix_filtered_shards.json`). The sample tokenizer path uses `--no-hard-vocab-limit` so SentencePiece won’t error on tiny corpora.
+2. **Sample data:** `uv run bash scripts/data/run_sample.sh` (downloads + filters RefinedWeb/Wiki/C4/SlimPajama/code samples, trains the tokenizer if missing, shards them, records stats in `data/mixtures/refinedweb_mix_filtered_shards.json`). If the canonical SlimPajama dataset endpoint is unavailable, the script automatically tries configured mirrors (`RPJ_DATASET` / `RPJ_DATASET_CANDIDATES`). The sample tokenizer path uses `--no-hard-vocab-limit` so SentencePiece won’t error on tiny corpora.
 3. **Smoke training:** `uv run bash scripts/run_smoke.sh pilot` (runs CPU pilot config, saves checkpoints to `artifacts/checkpoints/pilot_smoke/`).
 4. **Zero-shot sanity:** `uv run python scripts/eval/zeroshot.py --tasks piqa --max-samples 32 --checkpoint artifacts/examples/pilot_dummy.pt --tokenizer-path artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model --config configs/hope/pilot.yaml --device cpu`
 5. **Full automation (optional):** `uv run bash scripts/run_e2e_smoke.sh` (sync → sample data → smoke train → PIQA eval, logs under `logs/`).

@@ -3,7 +3,11 @@ from omegaconf import OmegaConf
 
 from nested_learning.levels import LevelSpec
 from nested_learning.model import HOPEModel, ModelConfig
-from nested_learning.training import _build_optimizer, _is_memory_param_name
+from nested_learning.training import (
+    _build_optimizer,
+    _is_memory_param_name,
+    _is_muon_candidate,
+)
 
 
 def _make_small_hope_model() -> HOPEModel:
@@ -74,3 +78,10 @@ def test_param_policy_only_memory_keeps_only_memory_params() -> None:
     }
     assert expected
     assert opt_params == expected
+
+
+def test_muon_candidate_requires_exactly_2d_params() -> None:
+    matrix = torch.nn.Parameter(torch.randn(16, 16))
+    conv_kernel = torch.nn.Parameter(torch.randn(16, 1, 4))
+    assert _is_muon_candidate("proj.weight", matrix)
+    assert not _is_muon_candidate("selfmod.local_conv.weight", conv_kernel)

@@ -16,7 +16,7 @@ The Stage 2 mixture mimics RefinedWeb + supplements. Download each source into
 | FineWeb-Edu | CC BY 4.0 (FineWeb) | Use `HuggingFaceFW/fineweb-edu` (e.g., `subset=sample-10BT`) via `scripts/data/filter_corpus.py` + `scripts/data/process_mixture.py`. | Paper-aligned option; prefer long-doc filtering if matching the paper’s setup. |
 | Wikipedia 2023-12 dump | CC BY-SA 3.0 | Download `https://huggingface.co/datasets/wikipedia/20220301.en` via HF CLI or mirror the XML dump. | Use HF `datasets load_dataset` inside the filtering script to avoid storing raw XML. |
 | C4 (en) | ODC-By | `uv run python scripts/data/shard_corpus.py --dataset allenai/c4 --subset en --split train --output data/raw/c4_en.ndjsonl --limit 8000000` | Heavy dataset; ensure disk quota before streaming. |
-| RedPajama CC subset | CC BY | Use `togethercomputer/RedPajama-Data-1T-Sample` or the CC subset tarballs. | Store gzipped JSONL files under `data/raw/redpajama/*.jsonl.gz`. |
+| RedPajama / SlimPajama subset | CC BY | Prefer canonical `cerebras/SlimPajama-627B`; if unavailable use mirrors (for example `MBZUAI-LLM/SlimPajama-627B-DC`, `DKYoon/SlimPajama-6B`) or CC subset tarballs. | Store gzipped JSONL files under `data/raw/redpajama/*.jsonl.gz`, and log the exact dataset id + retrieval date in the manifest. |
 | Code (Stack/Python mix) | Mostly MIT/Apache | Pull from `bigcode/starcoderdata` shards or permissively licensed repos. | Preserve LICENSE metadata per shard (`data/raw/code/LICENSES.md`). |
 
 Every corpus contribution is tracked in `data/manifest/refinedweb_full_manifest.json`. Regenerate or edit this manifest whenever the mixture changes so downstream runs can validate shard presence and licensing.
@@ -41,7 +41,7 @@ uv run python scripts/data/train_tokenizer.py \
   --log-file data/mixtures/refinedweb_mix_tokenizer.json
 ```
 
-The manifest pulls small samples from FineWeb (RefinedWeb proxy), Wikimedia/Wikipedia, AllenAI C4, SlimPajama, and codeparrot code datasets. Outputs live in `artifacts/tokenizer/refinedweb_mix/`.
+The manifest pulls small samples from FineWeb (RefinedWeb proxy), Wikimedia/Wikipedia, AllenAI C4, SlimPajama (with mirrored fallback ids where needed), and codeparrot code datasets. Outputs live in `artifacts/tokenizer/refinedweb_mix/`.
 
 ### Sample pipeline note (hard vocab limit)
 When training a tokenizer on **tiny local samples**, SentencePiece can fail if it cannot reach the requested `--vocab-size` (default `hard_vocab_limit=true`).
