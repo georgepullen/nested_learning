@@ -246,7 +246,7 @@ class HOPEModel(nn.Module):
         pre_norm = cast(torch.Tensor, x)
         x = self.norm(pre_norm)
         logits = self.lm_head(x)
-        if teach_signal is not None:
+        if teach_signal is not None or teach_signals is not None:
             self._latest_update_metrics = self._gather_block_stats()
         return logits, pre_norm
 
@@ -391,7 +391,12 @@ class HOPEModel(nn.Module):
         self._latest_update_metrics = {}
         return metrics
 
-    def init_fast_state(self) -> ModelFastState:
+    def init_fast_state(
+        self,
+        *,
+        batch_size: int = 1,
+        fast_state_batch_mode: str = "shared",
+    ) -> ModelFastState:
         states = []
         for block in self.blocks:
             if isinstance(block, HOPEBlock):
@@ -402,6 +407,8 @@ class HOPEModel(nn.Module):
                     specs=specs,
                     optimizer_configs=block.config.optimizer_configs,
                     default_lr=block.config.self_mod_lr,
+                    batch_size=batch_size,
+                    fast_state_batch_mode=fast_state_batch_mode,
                 )
                 states.append(state)
             elif isinstance(block, HOPEAttentionBlock):
@@ -412,6 +419,8 @@ class HOPEModel(nn.Module):
                     specs=specs,
                     optimizer_configs=block.config.optimizer_configs,
                     default_lr=block.config.self_mod_lr,
+                    batch_size=batch_size,
+                    fast_state_batch_mode=fast_state_batch_mode,
                 )
                 states.append(state)
             elif isinstance(block, HOPESelfModBlock):
@@ -423,6 +432,8 @@ class HOPEModel(nn.Module):
                     specs=specs,
                     optimizer_configs=block.config.optimizer_configs,
                     default_lr=block.config.self_mod_lr,
+                    batch_size=batch_size,
+                    fast_state_batch_mode=fast_state_batch_mode,
                 )
                 states.append(state)
             elif isinstance(block, TransformerBlock):
@@ -432,6 +443,8 @@ class HOPEModel(nn.Module):
                     specs=(),
                     optimizer_configs={},
                     default_lr=0.0,
+                    batch_size=batch_size,
+                    fast_state_batch_mode=fast_state_batch_mode,
                 )
                 states.append(state)
             else:

@@ -24,14 +24,27 @@ class JSONLogger(BaseLogger):
     def __init__(self, path: Path):
         self.path = path
         self.records: list[Dict[str, Any]] = []
+        if self.path.exists():
+            try:
+                payload = json.loads(self.path.read_text())
+            except json.JSONDecodeError:
+                payload = []
+            if isinstance(payload, list):
+                self.records = payload
 
     def log(self, metrics: Dict[str, Any], step: int) -> None:
         payload = {"step": step, **metrics}
         self.records.append(payload)
+        self._flush()
 
     def finish(self) -> None:
+        self._flush()
+
+    def _flush(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.records, indent=2))
+        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(self.records, indent=2))
+        tmp_path.replace(self.path)
 
 
 class WandbLogger(BaseLogger):

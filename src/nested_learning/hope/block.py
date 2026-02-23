@@ -11,6 +11,7 @@ from ..backbones import AttentionConfig, SelfAttention
 from ..cms import CMS
 from ..fast_state import BlockFastState
 from ..functional import (
+    call_with_batched_deltas,
     call_with_deltas,
     call_with_params,
     grads_to_dict,
@@ -44,6 +45,167 @@ def _chunk_loss(
 def _min_update_period(levels: Sequence[LevelSpec]) -> int:
     periods = [int(spec.update_period) for spec in levels if int(spec.update_period) > 0]
     return min(periods) if periods else 1
+
+
+def _tick_manager(level_manager: LevelOptimizerManager | list[LevelOptimizerManager]) -> None:
+    if isinstance(level_manager, list):
+        for manager in level_manager:
+            manager.tick()
+        return
+    level_manager.tick()
+
+
+def _manager_for_sample(
+    level_manager: LevelOptimizerManager | list[LevelOptimizerManager],
+    sample_idx: int,
+) -> LevelOptimizerManager:
+    if isinstance(level_manager, list):
+        return level_manager[sample_idx]
+    return level_manager
+
+
+def _call_with_deltas_maybe_list(
+    module: nn.Module,
+    deltas: Dict[str, torch.Tensor] | list[Dict[str, torch.Tensor]],
+    inputs: torch.Tensor,
+    *,
+    batch_mode: str | None = None,
+) -> torch.Tensor:
+    if batch_mode is not None:
+        mode = str(batch_mode).strip().lower()
+        if mode == "per_sample_list":
+            if not isinstance(deltas, list):
+                raise ValueError("per_sample_list mode requires list fast-state deltas")
+            outputs = []
+            for idx, sample_params in enumerate(deltas):
+                outputs.append(call_with_deltas(module, sample_params, inputs[idx : idx + 1]))
+            return torch.cat(outputs, dim=0)
+        if mode == "tensorized_cms":
+            if isinstance(deltas, list):
+                outputs = []
+                for idx, sample_params in enumerate(deltas):
+                    outputs.append(call_with_deltas(module, sample_params, inputs[idx : idx + 1]))
+                return torch.cat(outputs, dim=0)
+            return call_with_batched_deltas(module, deltas, inputs, validate=False)
+        if mode == "shared":
+            if isinstance(deltas, list):
+                raise ValueError("shared mode requires shared tensor deltas")
+            return call_with_deltas(module, deltas, inputs)
+        raise ValueError(f"Unsupported fast-state batch mode {batch_mode!r}")
+
+    if isinstance(deltas, list):
+        outputs = []
+        for idx, sample_params in enumerate(deltas):
+            outputs.append(call_with_deltas(module, sample_params, inputs[idx : idx + 1]))
+        return torch.cat(outputs, dim=0)
+    if _is_batched_delta_dict(module, deltas):
+        return call_with_batched_deltas(module, deltas, inputs, validate=False)
+    return call_with_deltas(module, deltas, inputs)
+
+
+def _is_batched_delta_dict(module: nn.Module, deltas: Dict[str, torch.Tensor]) -> bool:
+    flags: list[bool] = []
+    for name, param in module.named_parameters():
+        delta = deltas.get(name)
+        if delta is None:
+            continue
+        if delta.ndim == param.ndim:
+            flags.append(False)
+            continue
+        if delta.ndim == param.ndim + 1:
+            flags.append(True)
+            continue
+        raise ValueError(
+            f"Delta rank mismatch for {name!r}: got {delta.ndim}, expected {param.ndim} or {param.ndim + 1}"
+        )
+    if not flags:
+        return False
+    if any(flags) and not all(flags):
+        raise ValueError("Mixed batched and unbatched fast-state deltas are not supported")
+    return all(flags)
+
+
+def _apply_tensorized_cms_grads(
+    *,
+    module: nn.Module,
+    level_name: str,
+    base_params: Dict[str, torch.Tensor],
+    chunk_inputs: torch.Tensor,
+    chunk_teach: torch.Tensor,
+    chunk_active: torch.Tensor,
+    reduction: str,
+    level_manager: LevelOptimizerManager | list[LevelOptimizerManager],
+) -> tuple[Dict[str, torch.Tensor], float]:
+    active_samples = chunk_active.any(dim=1)
+    all_active = bool(active_samples.all().item())
+    mask_f = None if all_active else chunk_active.unsqueeze(-1).float()
+    params_req = require_grad_params(base_params)
+    with torch.enable_grad():
+        prediction = call_with_batched_deltas(module, params_req, chunk_inputs, validate=False)
+        if mask_f is None:
+            target = (prediction.detach() - chunk_teach).detach()
+            diff_sq = (prediction - target).pow(2)
+            if reduction == "mean":
+                loss = diff_sq.mean()
+            elif reduction == "sum":
+                loss = diff_sq.sum()
+            else:
+                raise ValueError(f"Unsupported cms_chunk_reduction={reduction}")
+        else:
+            loss = _chunk_loss(
+                prediction,
+                chunk_teach,
+                mask_f,
+                reduction=reduction,
+            )
+    grads = torch.autograd.grad(
+        loss,
+        tuple(params_req.values()),
+        retain_graph=False,
+        allow_unused=True,
+    )
+    grads_dict = grads_to_dict(params_req, grads)
+    needs_context = False
+    if isinstance(level_manager, list):
+        if level_manager:
+            needs_context = level_manager[0].needs_context(level_name)
+    else:
+        needs_context = level_manager.needs_context(level_name)
+    contexts = chunk_inputs.mean(dim=1) if needs_context else None
+    if isinstance(level_manager, list):
+        # Fallback oracle path: preserve existing per-sample apply semantics.
+        updated_batched = {name: value.detach().clone() for name, value in base_params.items()}
+        total_magnitude = 0.0
+        for sample_idx in range(int(chunk_inputs.size(0))):
+            if not bool(active_samples[sample_idx]):
+                continue
+            sample_params = {name: value[sample_idx] for name, value in base_params.items()}
+            sample_grads = {name: value[sample_idx] for name, value in grads_dict.items()}
+            manager = level_manager[sample_idx]
+            updated, magnitude = manager.apply_grads(
+                level_name,
+                sample_params,
+                sample_grads,
+                context=contexts[sample_idx] if contexts is not None else None,
+                force=True,
+            )
+            manager.pop_last_metrics(level_name)
+            for name, value in updated.items():
+                updated_batched[name][sample_idx] = value
+            total_magnitude += magnitude
+        return {name: value.detach() for name, value in updated_batched.items()}, total_magnitude
+
+    updated, total_magnitude = level_manager.apply_grads_batched(
+        level_name,
+        base_params,
+        grads_dict,
+        context=contexts,
+        sample_mask=None if all_active else active_samples,
+        validate=False,
+        force=True,
+    )
+    level_manager.pop_last_metrics(level_name)
+    return updated, total_magnitude
 
 
 @dataclass
@@ -190,7 +352,7 @@ class HOPEAttentionBlock(nn.Module):
             cms_out, cms_inputs = self._cms_forward_fast(attn_out, fast_state)
             if teach_signal is not None:
                 self._update_cms_fast(fast_state, cms_inputs, teach_signal, surprise_value)
-        fast_state.level_manager.tick()
+        _tick_manager(fast_state.level_manager)
         return cms_out
 
     def set_surprise_threshold(self, threshold: float | None) -> None:
@@ -218,7 +380,12 @@ class HOPEAttentionBlock(nn.Module):
             level_name = spec.name
             inputs[level_name] = current
             params = fast_state.cms_params[level_name]
-            current = call_with_deltas(self.cms.blocks[level_name], params, current)
+            current = _call_with_deltas_maybe_list(
+                self.cms.blocks[level_name],
+                params,
+                current,
+                batch_mode=fast_state.batch_mode,
+            )
         return current, inputs
 
     def _cms_forward_online(
@@ -334,7 +501,12 @@ class HOPEAttentionBlock(nn.Module):
                 level_name = spec.name
                 level_inputs[level_name] = current
                 params = fast_state.cms_params[level_name]
-                current = call_with_deltas(self.cms.blocks[level_name], params, current)
+                current = _call_with_deltas_maybe_list(
+                    self.cms.blocks[level_name],
+                    params,
+                    current,
+                    batch_mode=fast_state.batch_mode,
+                )
             outputs.append(current)
 
             for spec in self.config.cms_levels:
@@ -570,6 +742,62 @@ class HOPEAttentionBlock(nn.Module):
             return 0.0
         mask_f = chunk_active.unsqueeze(-1).float()
         base_params = fast_state.cms_params[level_name]
+        if isinstance(base_params, list):
+            updated_params: list[Dict[str, torch.Tensor]] = []
+            total_magnitude = 0.0
+            for sample_idx, sample_params in enumerate(base_params):
+                sample_active = chunk_active[sample_idx : sample_idx + 1]
+                if not bool(sample_active.any()):
+                    updated_params.append(sample_params)
+                    continue
+                sample_inputs = chunk_inputs[sample_idx : sample_idx + 1]
+                sample_teach = chunk_teach[sample_idx : sample_idx + 1]
+                sample_mask = mask_f[sample_idx : sample_idx + 1]
+                forward_params = params_with_deltas(self.cms.blocks[level_name], sample_params)
+                params_req = require_grad_params(forward_params)
+                with torch.enable_grad():
+                    prediction = call_with_params(self.cms.blocks[level_name], params_req, sample_inputs)
+                    loss = _chunk_loss(
+                        prediction,
+                        sample_teach,
+                        sample_mask,
+                        reduction=self.config.cms_chunk_reduction,
+                    )
+                grads = torch.autograd.grad(
+                    loss,
+                    tuple(params_req.values()),
+                    retain_graph=False,
+                    allow_unused=True,
+                )
+                grads_dict = grads_to_dict(params_req, grads)
+                context_vec = sample_inputs.mean(dim=(0, 1))
+                level_manager = _manager_for_sample(fast_state.level_manager, sample_idx)
+                updated, magnitude = level_manager.apply_grads(
+                    level_name,
+                    sample_params,
+                    grads_dict,
+                    context=context_vec,
+                    force=True,
+                )
+                level_manager.pop_last_metrics(level_name)
+                updated_params.append(updated)
+                total_magnitude += magnitude
+            fast_state.cms_params[level_name] = updated_params
+            return total_magnitude
+        if _is_batched_delta_dict(self.cms.blocks[level_name], base_params):
+            updated, magnitude = _apply_tensorized_cms_grads(
+                module=self.cms.blocks[level_name],
+                level_name=level_name,
+                base_params=base_params,
+                chunk_inputs=chunk_inputs,
+                chunk_teach=chunk_teach,
+                chunk_active=chunk_active,
+                reduction=self.config.cms_chunk_reduction,
+                level_manager=fast_state.level_manager,
+            )
+            fast_state.cms_params[level_name] = updated
+            return magnitude
+
         forward_params = params_with_deltas(self.cms.blocks[level_name], base_params)
         params_req = require_grad_params(forward_params)
         with torch.enable_grad():
@@ -588,7 +816,8 @@ class HOPEAttentionBlock(nn.Module):
         )
         grads_dict = grads_to_dict(params_req, grads)
         context_vec = chunk_inputs.mean(dim=(0, 1))
-        updated, magnitude = fast_state.level_manager.apply_grads(
+        level_manager = _manager_for_sample(fast_state.level_manager, 0)
+        updated, magnitude = level_manager.apply_grads(
             level_name,
             base_params,
             grads_dict,
@@ -596,7 +825,7 @@ class HOPEAttentionBlock(nn.Module):
             force=True,
         )
         fast_state.cms_params[level_name] = updated
-        fast_state.level_manager.pop_last_metrics(level_name)
+        level_manager.pop_last_metrics(level_name)
         return magnitude
 
 
@@ -697,7 +926,27 @@ class HOPESelfModBlock(nn.Module):
 
         if fast_state.selfmod_state is None:
             raise ValueError("fast_state.selfmod_state is required for hope_selfmod variant")
-        if self.config.selfmod_online_updates and teach_signal is not None:
+        if isinstance(fast_state.selfmod_state, list):
+            outputs: list[torch.Tensor] = []
+            if self.config.selfmod_online_updates and teach_signal is not None:
+                updated_states = []
+                for sample_idx, sample_state in enumerate(fast_state.selfmod_state):
+                    sample_out, sample_updated = self.selfmod.forward_with_updates(
+                        x[sample_idx : sample_idx + 1],
+                        sample_state,
+                    )
+                    outputs.append(sample_out)
+                    updated_states.append(sample_updated)
+                fast_state.selfmod_state = updated_states
+            else:
+                for sample_idx, sample_state in enumerate(fast_state.selfmod_state):
+                    sample_out = self.selfmod.forward_with_state(
+                        x[sample_idx : sample_idx + 1],
+                        sample_state,
+                    )
+                    outputs.append(sample_out)
+            o = torch.cat(outputs, dim=0)
+        elif self.config.selfmod_online_updates and teach_signal is not None:
             o, updated = self.selfmod.forward_with_updates(x, fast_state.selfmod_state)
             fast_state.selfmod_state = updated
         else:
@@ -708,7 +957,7 @@ class HOPESelfModBlock(nn.Module):
             cms_out, cms_inputs = self._cms_forward_fast(o, fast_state)
             if teach_signal is not None:
                 self._update_cms_fast(fast_state, cms_inputs, teach_signal, surprise_value)
-        fast_state.level_manager.tick()
+        _tick_manager(fast_state.level_manager)
         return cms_out
 
     def set_surprise_threshold(self, threshold: float | None) -> None:
@@ -736,7 +985,12 @@ class HOPESelfModBlock(nn.Module):
             level_name = spec.name
             inputs[level_name] = current
             params = fast_state.cms_params[level_name]
-            current = call_with_deltas(self.cms.blocks[level_name], params, current)
+            current = _call_with_deltas_maybe_list(
+                self.cms.blocks[level_name],
+                params,
+                current,
+                batch_mode=fast_state.batch_mode,
+            )
         return current, inputs
 
     def _cms_forward_online(
@@ -852,7 +1106,12 @@ class HOPESelfModBlock(nn.Module):
                 level_name = spec.name
                 level_inputs[level_name] = current
                 params = fast_state.cms_params[level_name]
-                current = call_with_deltas(self.cms.blocks[level_name], params, current)
+                current = _call_with_deltas_maybe_list(
+                    self.cms.blocks[level_name],
+                    params,
+                    current,
+                    batch_mode=fast_state.batch_mode,
+                )
             outputs.append(current)
 
             for spec in self.config.cms_levels:
@@ -1088,6 +1347,63 @@ class HOPESelfModBlock(nn.Module):
             return 0.0
         mask_f = chunk_active.unsqueeze(-1).float()
         base_params = fast_state.cms_params[level_name]
+        if isinstance(base_params, list):
+            updated_params: list[Dict[str, torch.Tensor]] = []
+            total_magnitude = 0.0
+            for sample_idx, sample_params in enumerate(base_params):
+                sample_active = chunk_active[sample_idx : sample_idx + 1]
+                if not bool(sample_active.any()):
+                    updated_params.append(sample_params)
+                    continue
+                sample_inputs = chunk_inputs[sample_idx : sample_idx + 1]
+                sample_teach = chunk_teach[sample_idx : sample_idx + 1]
+                sample_mask = mask_f[sample_idx : sample_idx + 1]
+                forward_params = params_with_deltas(self.cms.blocks[level_name], sample_params)
+                params_req = require_grad_params(forward_params)
+                with torch.enable_grad():
+                    prediction = call_with_params(self.cms.blocks[level_name], params_req, sample_inputs)
+                    loss = _chunk_loss(
+                        prediction,
+                        sample_teach,
+                        sample_mask,
+                        reduction=self.config.cms_chunk_reduction,
+                    )
+                grads = torch.autograd.grad(
+                    loss,
+                    tuple(params_req.values()),
+                    retain_graph=False,
+                    allow_unused=True,
+                )
+                grads_dict = grads_to_dict(params_req, grads)
+                context_vec = sample_inputs.mean(dim=(0, 1))
+                level_manager = _manager_for_sample(fast_state.level_manager, sample_idx)
+                updated, magnitude = level_manager.apply_grads(
+                    level_name,
+                    sample_params,
+                    grads_dict,
+                    context=context_vec,
+                    force=True,
+                )
+                level_manager.pop_last_metrics(level_name)
+                updated_params.append(updated)
+                total_magnitude += magnitude
+            fast_state.cms_params[level_name] = updated_params
+            return total_magnitude
+
+        if _is_batched_delta_dict(self.cms.blocks[level_name], base_params):
+            updated, magnitude = _apply_tensorized_cms_grads(
+                module=self.cms.blocks[level_name],
+                level_name=level_name,
+                base_params=base_params,
+                chunk_inputs=chunk_inputs,
+                chunk_teach=chunk_teach,
+                chunk_active=chunk_active,
+                reduction=self.config.cms_chunk_reduction,
+                level_manager=fast_state.level_manager,
+            )
+            fast_state.cms_params[level_name] = updated
+            return magnitude
+
         forward_params = params_with_deltas(self.cms.blocks[level_name], base_params)
         params_req = require_grad_params(forward_params)
         with torch.enable_grad():
@@ -1106,7 +1422,8 @@ class HOPESelfModBlock(nn.Module):
         )
         grads_dict = grads_to_dict(params_req, grads)
         context_vec = chunk_inputs.mean(dim=(0, 1))
-        updated, magnitude = fast_state.level_manager.apply_grads(
+        level_manager = _manager_for_sample(fast_state.level_manager, 0)
+        updated, magnitude = level_manager.apply_grads(
             level_name,
             base_params,
             grads_dict,
@@ -1114,7 +1431,7 @@ class HOPESelfModBlock(nn.Module):
             force=True,
         )
         fast_state.cms_params[level_name] = updated
-        fast_state.level_manager.pop_last_metrics(level_name)
+        level_manager.pop_last_metrics(level_name)
         return magnitude
 
 
@@ -1183,7 +1500,12 @@ class HOPEBlock(nn.Module):
 
         if fast_state.titan_params is None:
             raise ValueError("fast_state.titan_params is required for HOPEBlock fast-state forward")
-        mem_out = call_with_deltas(self.titan_memory, fast_state.titan_params, attn_out)
+        mem_out = _call_with_deltas_maybe_list(
+            self.titan_memory,
+            fast_state.titan_params,
+            attn_out,
+            batch_mode=fast_state.batch_mode,
+        )
         combined = attn_out + mem_out
         if teach_signal is not None and self.config.cms_online_updates:
             cms_out = self._cms_forward_online_fast(
@@ -1195,7 +1517,7 @@ class HOPEBlock(nn.Module):
             if teach_signal is not None:
                 self._update_titan_fast(fast_state, attn_out, mem_out, teach_signal, surprise_value)
                 self._update_cms_fast(fast_state, cms_inputs, teach_signal, surprise_value)
-        fast_state.level_manager.tick()
+        _tick_manager(fast_state.level_manager)
         return cms_out
 
     def set_surprise_threshold(self, threshold: float | None) -> None:
@@ -1218,7 +1540,12 @@ class HOPEBlock(nn.Module):
             level_name = spec.name
             inputs[level_name] = current
             params = fast_state.cms_params[level_name]
-            current = call_with_deltas(self.cms.blocks[level_name], params, current)
+            current = _call_with_deltas_maybe_list(
+                self.cms.blocks[level_name],
+                params,
+                current,
+                batch_mode=fast_state.batch_mode,
+            )
         return current, inputs
 
 
@@ -1335,7 +1662,12 @@ class HOPEBlock(nn.Module):
                 level_name = spec.name
                 level_inputs[level_name] = current
                 params = fast_state.cms_params[level_name]
-                current = call_with_deltas(self.cms.blocks[level_name], params, current)
+                current = _call_with_deltas_maybe_list(
+                    self.cms.blocks[level_name],
+                    params,
+                    current,
+                    batch_mode=fast_state.batch_mode,
+                )
             outputs.append(current)
 
             for spec in self.config.cms_levels:
@@ -1464,12 +1796,125 @@ class HOPEBlock(nn.Module):
         level_name = self.config.titan_level.name
         if not self._is_level_allowed("titan"):
             return
-        if not fast_state.level_manager.should_update(level_name):
-            return
         if not self._passes_surprise(surprise_value):
             self._record_gate(level_name, hit=False)
             return
         if fast_state.titan_params is None:
+            return
+        base_params = fast_state.titan_params
+        if isinstance(base_params, list):
+            updated_params: list[Dict[str, torch.Tensor]] = []
+            total_magnitude = 0.0
+            total_hits = 0.0
+            for sample_idx, sample_params in enumerate(base_params):
+                level_manager = _manager_for_sample(fast_state.level_manager, sample_idx)
+                if not level_manager.should_update(level_name):
+                    updated_params.append(sample_params)
+                    continue
+                sample_attn = attn_out[sample_idx : sample_idx + 1].detach()
+                sample_mem = mem_out[sample_idx : sample_idx + 1].detach()
+                sample_teach = teach_signal[sample_idx : sample_idx + 1].detach()
+                modifier = self.self_modifier(
+                    key=sample_attn,
+                    value=sample_mem,
+                    error_signal=sample_teach,
+                )
+                context_vec = sample_attn.mean(dim=(0, 1))
+                forward_params = params_with_deltas(self.titan_memory, sample_params)
+                params_req = require_grad_params(forward_params)
+                with torch.enable_grad():
+                    target = (modifier - sample_teach).detach()
+                    prediction = call_with_params(self.titan_memory, params_req, sample_attn)
+                    loss_terms = F.mse_loss(prediction, target, reduction="none")
+                    active = sample_teach.abs().sum(dim=-1, keepdim=True) > 0
+                    mask = active.float()
+                    if self.surprise_threshold is not None and self.surprise_metric == "l2":
+                        norms = sample_teach.norm(dim=-1, keepdim=True)
+                        mask = mask * (norms >= self.surprise_threshold).float()
+                    loss = (loss_terms * mask).sum() / mask.sum().clamp(min=1.0)
+                grads = torch.autograd.grad(
+                    loss,
+                    tuple(params_req.values()),
+                    retain_graph=False,
+                    allow_unused=True,
+                )
+                grads_dict = grads_to_dict(params_req, grads)
+                updated, magnitude = level_manager.apply_grads(
+                    level_name,
+                    sample_params,
+                    grads_dict,
+                    context=context_vec,
+                    force=False,
+                )
+                updated_params.append(updated)
+                level_manager.pop_last_metrics(level_name)
+                total_magnitude += magnitude
+                total_hits += 1.0
+            fast_state.titan_params = updated_params
+            if total_hits <= 0:
+                return
+            stats = {"grad_norm": total_magnitude, "gate_hit": total_hits}
+            if surprise_value is not None:
+                stats["surprise_value"] = surprise_value
+            self.last_update_stats[f"titan.{level_name}"] = stats
+            return
+
+        if _is_batched_delta_dict(self.titan_memory, base_params):
+            level_manager = _manager_for_sample(fast_state.level_manager, 0)
+            if not level_manager.should_update(level_name):
+                return
+            modifier = self.self_modifier(
+                key=attn_out.detach(),
+                value=mem_out.detach(),
+                error_signal=teach_signal.detach(),
+            )
+            with torch.enable_grad():
+                query = attn_out.detach()
+                target = (modifier - teach_signal.detach()).detach()
+                params_req = require_grad_params(base_params)
+                prediction = call_with_batched_deltas(
+                    self.titan_memory,
+                    params_req,
+                    query,
+                    validate=False,
+                )
+                loss_terms = F.mse_loss(prediction, target, reduction="none")
+                active = teach_signal.detach().abs().sum(dim=-1, keepdim=True) > 0
+                mask = active.float()
+                if self.surprise_threshold is not None and self.surprise_metric == "l2":
+                    norms = teach_signal.norm(dim=-1, keepdim=True)
+                    mask = mask * (norms >= self.surprise_threshold).float()
+                loss = (loss_terms * mask).sum() / mask.sum().clamp(min=1.0)
+            grads = torch.autograd.grad(
+                loss,
+                tuple(params_req.values()),
+                retain_graph=False,
+                allow_unused=True,
+            )
+            grads_dict = grads_to_dict(params_req, grads)
+            active_samples = active.squeeze(-1).any(dim=1)
+            sample_mask = None if bool(active_samples.all().item()) else active_samples
+            context = attn_out.detach().mean(dim=1) if level_manager.needs_context(level_name) else None
+            updated, magnitude = level_manager.apply_grads_batched(
+                level_name,
+                base_params,
+                grads_dict,
+                context=context,
+                sample_mask=sample_mask,
+                validate=False,
+                force=False,
+            )
+            fast_state.titan_params = updated
+            extra_metrics = level_manager.pop_last_metrics(level_name)
+            stats = {"grad_norm": magnitude, "gate_hit": 1.0}
+            if surprise_value is not None:
+                stats["surprise_value"] = surprise_value
+            stats.update(extra_metrics)
+            self.last_update_stats[f"titan.{level_name}"] = stats
+            return
+
+        level_manager = _manager_for_sample(fast_state.level_manager, 0)
+        if not level_manager.should_update(level_name):
             return
         modifier = self.self_modifier(
             key=attn_out.detach(),
@@ -1477,7 +1922,6 @@ class HOPEBlock(nn.Module):
             error_signal=teach_signal.detach(),
         )
         context_vec = attn_out.detach().mean(dim=(0, 1))
-        base_params = fast_state.titan_params
         forward_params = params_with_deltas(self.titan_memory, base_params)
         params_req = require_grad_params(forward_params)
         with torch.enable_grad():
@@ -1498,7 +1942,7 @@ class HOPEBlock(nn.Module):
             allow_unused=True,
         )
         grads_dict = grads_to_dict(params_req, grads)
-        updated, magnitude = fast_state.level_manager.apply_grads(
+        updated, magnitude = level_manager.apply_grads(
             level_name,
             base_params,
             grads_dict,
@@ -1506,7 +1950,7 @@ class HOPEBlock(nn.Module):
             force=False,
         )
         fast_state.titan_params = updated
-        extra_metrics = fast_state.level_manager.pop_last_metrics(level_name)
+        extra_metrics = level_manager.pop_last_metrics(level_name)
         stats = {"grad_norm": magnitude, "gate_hit": 1.0}
         if surprise_value is not None:
             stats["surprise_value"] = surprise_value
@@ -1673,6 +2117,63 @@ class HOPEBlock(nn.Module):
             return 0.0
         mask_f = chunk_active.unsqueeze(-1).float()
         base_params = fast_state.cms_params[level_name]
+        if isinstance(base_params, list):
+            updated_params: list[Dict[str, torch.Tensor]] = []
+            total_magnitude = 0.0
+            for sample_idx, sample_params in enumerate(base_params):
+                sample_active = chunk_active[sample_idx : sample_idx + 1]
+                if not bool(sample_active.any()):
+                    updated_params.append(sample_params)
+                    continue
+                sample_inputs = chunk_inputs[sample_idx : sample_idx + 1]
+                sample_teach = chunk_teach[sample_idx : sample_idx + 1]
+                sample_mask = mask_f[sample_idx : sample_idx + 1]
+                forward_params = params_with_deltas(self.cms.blocks[level_name], sample_params)
+                params_req = require_grad_params(forward_params)
+                with torch.enable_grad():
+                    prediction = call_with_params(self.cms.blocks[level_name], params_req, sample_inputs)
+                    loss = _chunk_loss(
+                        prediction,
+                        sample_teach,
+                        sample_mask,
+                        reduction=self.config.cms_chunk_reduction,
+                    )
+                grads = torch.autograd.grad(
+                    loss,
+                    tuple(params_req.values()),
+                    retain_graph=False,
+                    allow_unused=True,
+                )
+                grads_dict = grads_to_dict(params_req, grads)
+                context_vec = sample_inputs.mean(dim=(0, 1))
+                level_manager = _manager_for_sample(fast_state.level_manager, sample_idx)
+                updated, magnitude = level_manager.apply_grads(
+                    level_name,
+                    sample_params,
+                    grads_dict,
+                    context=context_vec,
+                    force=True,
+                )
+                level_manager.pop_last_metrics(level_name)
+                updated_params.append(updated)
+                total_magnitude += magnitude
+            fast_state.cms_params[level_name] = updated_params
+            return total_magnitude
+
+        if _is_batched_delta_dict(self.cms.blocks[level_name], base_params):
+            updated, magnitude = _apply_tensorized_cms_grads(
+                module=self.cms.blocks[level_name],
+                level_name=level_name,
+                base_params=base_params,
+                chunk_inputs=chunk_inputs,
+                chunk_teach=chunk_teach,
+                chunk_active=chunk_active,
+                reduction=self.config.cms_chunk_reduction,
+                level_manager=fast_state.level_manager,
+            )
+            fast_state.cms_params[level_name] = updated
+            return magnitude
+
         forward_params = params_with_deltas(self.cms.blocks[level_name], base_params)
         params_req = require_grad_params(forward_params)
         with torch.enable_grad():
@@ -1691,7 +2192,8 @@ class HOPEBlock(nn.Module):
         )
         grads_dict = grads_to_dict(params_req, grads)
         context_vec = chunk_inputs.mean(dim=(0, 1))
-        updated, magnitude = fast_state.level_manager.apply_grads(
+        level_manager = _manager_for_sample(fast_state.level_manager, 0)
+        updated, magnitude = level_manager.apply_grads(
             level_name,
             base_params,
             grads_dict,
@@ -1699,7 +2201,7 @@ class HOPEBlock(nn.Module):
             force=True,
         )
         fast_state.cms_params[level_name] = updated
-        fast_state.level_manager.pop_last_metrics(level_name)
+        level_manager.pop_last_metrics(level_name)
         return magnitude
 
     def pop_update_stats(self) -> Dict[str, Dict[str, float]]:

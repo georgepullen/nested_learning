@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import pickle
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Dict, Protocol, Tuple, cast
+from typing import Callable, Dict, Protocol, Tuple, cast
 
 import numpy as np
 import torch
@@ -228,6 +230,7 @@ def compute_teach_signal(
     tokens: torch.Tensor,
     *,
     ignore_index: int | None = None,
+    normalization: str = "global",
 ) -> torch.Tensor:
     """
     Approximate dL/dh where h is the hidden state before the LM head.
@@ -244,6 +247,13 @@ def compute_teach_signal(
     target_tokens = tokens[:, 1:]
     residual = probs[:, :-1].clone()
 
+    mode = str(normalization).strip().lower()
+    if mode not in {"global", "per_sample"}:
+        raise ValueError(
+            f"Unsupported teach signal normalization={normalization!r}; "
+            "expected one of ['global', 'per_sample']"
+        )
+
     if ignore_index is None:
         safe_targets = target_tokens
         src = -torch.ones(
@@ -251,14 +261,29 @@ def compute_teach_signal(
             device=residual.device,
             dtype=residual.dtype,
         )
-        denom: torch.Tensor | float = max(1, tokens.size(0) * max(1, tokens.size(1) - 1))
+        if mode == "per_sample":
+            denom = torch.full(
+                (tokens.size(0), 1, 1),
+                float(max(1, tokens.size(1) - 1)),
+                device=residual.device,
+                dtype=residual.dtype,
+            )
+        else:
+            denom = torch.tensor(
+                float(max(1, tokens.size(0) * max(1, tokens.size(1) - 1))),
+                device=residual.device,
+                dtype=residual.dtype,
+            )
     else:
         active = target_tokens != ignore_index
         safe_targets = torch.where(active, target_tokens, torch.zeros_like(target_tokens))
         active_f = active.to(dtype=residual.dtype)
         residual.mul_(active_f.unsqueeze(-1))
         src = -active_f.unsqueeze(-1)
-        denom = active_f.sum().clamp(min=1.0)
+        if mode == "per_sample":
+            denom = active_f.sum(dim=1, keepdim=True).clamp(min=1.0).unsqueeze(-1)
+        else:
+            denom = active_f.sum().clamp(min=1.0)
 
     residual.scatter_add_(-1, safe_targets.unsqueeze(-1), src)
     residual = residual / denom
@@ -305,6 +330,68 @@ def _compute_surprise_override(
         entropy = -(probs * torch.log(probs.clamp(min=1e-9))).sum(dim=-1).mean()
         return float(entropy.item())
     return None
+
+
+def _l2_norm_paramdict(params: Dict[str, torch.Tensor]) -> float:
+    total = 0.0
+    for value in params.values():
+        total += float(value.detach().float().pow(2).sum().item())
+    return float(math.sqrt(total + 1e-12))
+
+
+def _isolation_checksum(params: Dict[str, torch.Tensor]) -> float:
+    checksum = 0.0
+    for idx, (_, value) in enumerate(sorted(params.items())):
+        checksum += float((idx + 1) * value.detach().float().mean().item())
+    return checksum
+
+
+def _fast_state_metrics(fast_state) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    for layer_idx, block_state in enumerate(getattr(fast_state, "blocks", [])):
+        cms_params = getattr(block_state, "cms_params", {})
+        for level_name, store in cms_params.items():
+            key_prefix = f"fast_state.layer{layer_idx}.cms.{level_name}"
+            if isinstance(store, list):
+                norms = [_l2_norm_paramdict(sample) for sample in store]
+                checksums = [_isolation_checksum(sample) for sample in store]
+                if norms:
+                    mean_norm = float(sum(norms) / len(norms))
+                    metrics[f"{key_prefix}.delta_norm"] = mean_norm
+                    metrics[f"{key_prefix}.delta_change"] = mean_norm
+                    metrics[f"{key_prefix}.isolation_checksum_mean"] = float(
+                        sum(checksums) / len(checksums)
+                    )
+                    metrics[f"{key_prefix}.isolation_checksum_min"] = float(min(checksums))
+                    metrics[f"{key_prefix}.isolation_checksum_max"] = float(max(checksums))
+            else:
+                norm = _l2_norm_paramdict(store)
+                metrics[f"{key_prefix}.delta_norm"] = norm
+                metrics[f"{key_prefix}.delta_change"] = norm
+                metrics[f"{key_prefix}.isolation_checksum"] = _isolation_checksum(store)
+
+        titan_store = getattr(block_state, "titan_params", None)
+        if titan_store is None:
+            continue
+        titan_prefix = f"fast_state.layer{layer_idx}.titan"
+        if isinstance(titan_store, list):
+            norms = [_l2_norm_paramdict(sample) for sample in titan_store]
+            checksums = [_isolation_checksum(sample) for sample in titan_store]
+            if norms:
+                mean_norm = float(sum(norms) / len(norms))
+                metrics[f"{titan_prefix}.delta_norm"] = mean_norm
+                metrics[f"{titan_prefix}.delta_change"] = mean_norm
+                metrics[f"{titan_prefix}.isolation_checksum_mean"] = float(
+                    sum(checksums) / len(checksums)
+                )
+                metrics[f"{titan_prefix}.isolation_checksum_min"] = float(min(checksums))
+                metrics[f"{titan_prefix}.isolation_checksum_max"] = float(max(checksums))
+        else:
+            norm = _l2_norm_paramdict(titan_store)
+            metrics[f"{titan_prefix}.delta_norm"] = norm
+            metrics[f"{titan_prefix}.delta_change"] = norm
+            metrics[f"{titan_prefix}.isolation_checksum"] = _isolation_checksum(titan_store)
+    return metrics
 
 
 def _infer_online_chunk_size(model: HOPEModel) -> int | None:
@@ -403,26 +490,112 @@ def _validate_distributed_config(cfg: DictConfig, distributed: bool) -> None:
         )
 
 
-def _validate_fast_state_batch_semantics(cfg: DictConfig) -> None:
-    if not bool(cfg.train.get("use_fast_state", False)):
-        return
+def _cfg_batch_size(cfg: DictConfig) -> int:
     data_cfg = cfg.get("data")
     if data_cfg is None:
-        return
+        return 1
     batch_size_raw = data_cfg.get("batch_size", 1)
     try:
         batch_size = int(batch_size_raw)
     except (TypeError, ValueError):
+        return 1
+    return max(1, batch_size)
+
+
+def _resolve_fast_state_batch_mode(cfg: DictConfig, *, batch_size: int | None = None) -> str:
+    configured = str(cfg.train.get("fast_state_batch_mode", "auto")).strip().lower()
+    if configured in {"", "none"}:
+        configured = "auto"
+    if configured not in {"auto", "shared", "per_sample_list", "tensorized_cms"}:
+        raise ValueError(
+            "train.fast_state_batch_mode must be one of "
+            "['auto', 'shared', 'per_sample_list', 'tensorized_cms']"
+        )
+    bs = _cfg_batch_size(cfg) if batch_size is None else max(1, int(batch_size))
+    if configured == "auto":
+        use_fast_state = bool(cfg.train.get("use_fast_state", False))
+        if use_fast_state and bs > 1:
+            return "tensorized_cms"
+        return "shared"
+    return configured
+
+
+def _validate_fast_state_batch_semantics(cfg: DictConfig) -> None:
+    if not bool(cfg.train.get("use_fast_state", False)):
         return
+    batch_size = _cfg_batch_size(cfg)
     if batch_size <= 1:
         return
+    fast_state_batch_mode = _resolve_fast_state_batch_mode(cfg, batch_size=batch_size)
+    if fast_state_batch_mode in {"per_sample_list", "tensorized_cms"}:
+        return
     msg = (
-        "train.use_fast_state=true currently shares CMS/TITAN fast state across the batch. "
-        "For strict per-context semantics, set data.batch_size=1."
+        "train.use_fast_state=true with shared fast-state couples CMS/TITAN updates across the "
+        "batch. For strict per-context semantics, set "
+        "train.fast_state_batch_mode=per_sample_list or data.batch_size=1."
     )
     if bool(cfg.train.get("fail_if_paper_faithful_disabled", False)):
         raise RuntimeError(msg)
     print(f"[train] {msg}")
+
+
+def _validate_training_hyperparams(cfg: DictConfig) -> None:
+    grad_accum_steps = int(cfg.train.get("grad_accum_steps", 1) or 1)
+    if grad_accum_steps < 1:
+        raise ValueError("train.grad_accum_steps must be >= 1")
+    if not bool(cfg.train.get("online_updates", False)):
+        return
+    online_chunk_size = int(cfg.train.get("online_chunk_size", 0) or 0)
+    if online_chunk_size == 1:
+        raise ValueError(
+            "train.online_chunk_size=1 is invalid for next-token CE; "
+            "set train.online_chunk_size>=2 or 0 (auto-infer)."
+        )
+
+
+def _maybe_resume_training(
+    cfg: DictConfig,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    device: torch.device,
+    distributed: bool,
+    dist_ctx: DistributedContext | None,
+) -> int:
+    ckpt_cfg = cfg.train.get("checkpoint")
+    if not ckpt_cfg:
+        return 0
+    resume_path_raw = ckpt_cfg.get("resume_path")
+    if not resume_path_raw:
+        return 0
+    if distributed:
+        if dist_ctx is None:
+            return 0
+        if dist_ctx.rank == 0:
+            print(
+                "[train] train.checkpoint.resume_path is ignored in distributed mode here; "
+                "use train_fsdp.py or train_deepspeed.py resume paths."
+            )
+        return 0
+    resume_path = Path(str(resume_path_raw))
+    if not resume_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint {resume_path} not found")
+    verify_checkpoint_integrity(resume_path)
+    state = torch.load(resume_path, map_location=device, weights_only=False)
+    if not isinstance(state, dict):
+        raise ValueError(f"Resume checkpoint {resume_path} does not contain a state dictionary")
+    model_state = state.get("model")
+    if model_state is None:
+        model_state = state
+    if not isinstance(model_state, dict):
+        raise ValueError(f"Resume checkpoint {resume_path} has invalid model state")
+    model.load_state_dict(model_state, strict=True)
+    optimizer_state = state.get("optimizer")
+    if isinstance(optimizer_state, dict):
+        optimizer.load_state_dict(optimizer_state)
+    start_step = int(state.get("step", 0) or 0)
+    print(f"[train] resumed from {resume_path} at step {start_step}")
+    return start_step
 
 
 def run_training_loop(
@@ -431,14 +604,16 @@ def run_training_loop(
     device: torch.device,
     distributed: bool = False,
     dist_ctx: DistributedContext | None = None,
+    step_end_callback: Callable[[int], None] | None = None,
 ) -> Dict[str, float]:
     _validate_distributed_config(cfg, distributed)
     _validate_fast_state_batch_semantics(cfg)
-    model = build_model_from_cfg(cfg.model).to(device)
+    _validate_training_hyperparams(cfg)
     train_seed = cfg.train.get("seed")
     deterministic = cfg.train.get("deterministic", False)
     if train_seed is not None:
         _seed_everything(int(train_seed), deterministic=bool(deterministic))
+    model = build_model_from_cfg(cfg.model).to(device)
     model = _maybe_compile_model(model, cfg.train.get("compile"))
     if distributed:
         assert dist_ctx is not None
@@ -470,6 +645,14 @@ def run_training_loop(
         seed=dataloader_seed,
     )
     optimizer = _build_optimizer(base_model, cfg, device=device)
+    start_step = _maybe_resume_training(
+        cfg,
+        base_model,
+        optimizer,
+        device=device,
+        distributed=distributed,
+        dist_ctx=dist_ctx,
+    )
     autocast_factory = _make_autocast_factory(device, cfg.train.get("mixed_precision"))
     logger = init_logger(getattr(cfg, "logging", None), cfg)
     if distributed and dist_ctx is not None and dist_ctx.rank != 0:
@@ -477,11 +660,45 @@ def run_training_loop(
     _log_run_features(logger, base_model, cfg, optimizer, device)
     steps = cfg.train.steps
     log_interval = cfg.train.get("log_interval", 1)
+    grad_accum_steps = int(cfg.train.get("grad_accum_steps", 1) or 1)
     per_layer_teach = bool(cfg.train.get("per_layer_teach_signal", False))
     online_updates = bool(cfg.train.get("online_updates", False))
     online_chunk_size = int(cfg.train.get("online_chunk_size", 0) or 0)
     use_fast_state = bool(cfg.train.get("use_fast_state", False))
+    configured_fast_state_batch_mode = str(
+        cfg.train.get("fast_state_batch_mode", "auto")
+    ).strip().lower() or "auto"
+    batch_size_cfg = _cfg_batch_size(cfg)
+    fast_state_batch_mode = _resolve_fast_state_batch_mode(cfg, batch_size=batch_size_cfg)
+    if (
+        configured_fast_state_batch_mode in {"auto", "", "none"}
+        and use_fast_state
+        and batch_size_cfg > 1
+        and fast_state_batch_mode == "tensorized_cms"
+    ):
+        print(
+            "[train] fast_state_batch_mode=auto resolved to tensorized_cms for "
+            f"use_fast_state=true, data.batch_size={batch_size_cfg}"
+        )
+    logger.log(
+        {
+            "train.fast_state_batch_mode_configured": configured_fast_state_batch_mode,
+            "train.fast_state_batch_mode_resolved": fast_state_batch_mode,
+        },
+        step=-1,
+    )
+    teach_signal_normalization = str(
+        cfg.train.get("teach_signal_normalization", "global")
+    ).strip().lower()
+    if use_fast_state and fast_state_batch_mode in {"per_sample_list", "tensorized_cms"}:
+        teach_signal_normalization = "per_sample"
+    if teach_signal_normalization not in {"global", "per_sample"}:
+        raise ValueError(
+            "train.teach_signal_normalization must be one of ['global', 'per_sample']"
+        )
     fail_if_faithful_disabled = bool(cfg.train.get("fail_if_paper_faithful_disabled", False))
+    max_runtime_seconds = int(cfg.train.get("max_runtime_seconds", 23 * 3600))
+    run_start_time = time.time()
     if distributed and per_layer_teach:
         msg = "[train] per_layer_teach_signal disabled under DDP (uses base model methods)"
         if fail_if_faithful_disabled:
@@ -500,17 +717,41 @@ def run_training_loop(
             )
         print(msg)
         online_updates = False
+    dataloader_len = max(1, len(dataloader))
     step_iter = iter(dataloader)
     epoch = 0
+    if start_step > 0:
+        for skipped_step in range(start_step):
+            if sampler is not None and skipped_step % dataloader_len == 0:
+                sampler.set_epoch(epoch)
+                epoch += 1
+            try:
+                _ = next(step_iter)
+            except StopIteration:
+                step_iter = iter(dataloader)
+                _ = next(step_iter)
     metrics: Dict[str, float] = {}
+    default_tokens_per_step = int(cfg.data.get("batch_size", 1)) * int(
+        cfg.data.get("seq_len", 0) or 0
+    )
+    tokens_seen_total = max(0, int(start_step)) * max(0, default_tokens_per_step)
     surprise_metric_getter = getattr(base_model, "get_surprise_metric", None)
     surprise_metric = (
         str(surprise_metric_getter()).strip().lower()
         if callable(surprise_metric_getter)
         else str(cfg.model.get("surprise_metric", "l2")).strip().lower()
     )
-    for step in range(steps):
-        if sampler is not None and step % len(dataloader) == 0:
+    optimizer_steps_total = 0
+    micro_steps_since_optimizer_step = 0
+    optimizer.zero_grad(set_to_none=True)
+    for step in range(start_step, steps):
+        micro_steps_since_optimizer_step += 1
+        should_step_optimizer = (
+            micro_steps_since_optimizer_step >= grad_accum_steps or (step + 1) >= steps
+        )
+        if (time.time() - run_start_time) > max_runtime_seconds:
+            raise SystemExit(f"[runtime] Exceeded max_runtime_seconds={max_runtime_seconds}")
+        if sampler is not None and step % dataloader_len == 0:
             sampler.set_epoch(epoch)
             epoch += 1
         try:
@@ -519,27 +760,34 @@ def run_training_loop(
             step_iter = iter(dataloader)
             batch = next(step_iter)
         tokens = batch.to(device)
+        tokens_this_step = int(tokens.numel())
+        tokens_seen_total += tokens_this_step
         fast_state = None
         if use_fast_state:
             init_fn = getattr(base_model, "init_fast_state", None)
             if not callable(init_fn):
                 raise ValueError("train.use_fast_state=true requires model.init_fast_state()")
-            fast_state = init_fn()
+            try:
+                fast_state = init_fn(
+                    batch_size=int(tokens.size(0)),
+                    fast_state_batch_mode=fast_state_batch_mode,
+                )
+            except TypeError:
+                fast_state = init_fn()
         _apply_teach_schedule(base_model, cfg, step)
         update_metrics: Dict[str, float] = {}
+        surprise_value_for_step = 0.0
         if online_updates and hasattr(base_model, "forward_with_block_outputs"):
             total_loss = 0.0
             total_tokens = 0
             teach_signal_norm = 0.0
-            optimizer.zero_grad()
+            total_surprise = 0.0
             chunk_size = online_chunk_size
             if chunk_size <= 0:
                 inferred = _infer_online_chunk_size(base_model)
                 chunk_size = inferred if inferred is not None else tokens.size(1)
             if chunk_size < 2:
-                # Next-token CE needs at least 2 tokens per chunk. Clamp to avoid a silent no-op
-                # when configs infer update_period=1.
-                print(f"[train] online_chunk_size={chunk_size} is too small; clamping to 2")
+                # Next-token CE needs at least 2 tokens per chunk.
                 chunk_size = 2
             for start in range(0, tokens.size(1), chunk_size):
                 end = min(start + chunk_size, tokens.size(1))
@@ -564,15 +812,24 @@ def run_training_loop(
                 )
                 if per_layer_teach:
                     teach_signals = _compute_layer_teach_signals(loss, block_outputs)
-                    teach_signal_norm += float(
+                    chunk_teach_norm = float(
                         torch.stack([sig.norm(dim=-1).mean() for sig in teach_signals]).mean()
-                    ) * (chunk_tokens.size(1) - 1)
-                else:
-                    teach_signal = compute_teach_signal(base_model, logits, chunk_tokens)
-                    teach_signal_norm += (
-                        teach_signal.norm(dim=-1).mean().item() * (chunk_tokens.size(1) - 1)
                     )
-                loss.backward()
+                    teach_signal_norm += chunk_teach_norm * (chunk_tokens.size(1) - 1)
+                else:
+                    teach_signal = compute_teach_signal(
+                        base_model,
+                        logits,
+                        chunk_tokens,
+                        normalization=teach_signal_normalization,
+                    )
+                    chunk_teach_norm = teach_signal.norm(dim=-1).mean().item()
+                    teach_signal_norm += chunk_teach_norm * (chunk_tokens.size(1) - 1)
+                chunk_surprise = (
+                    surprise_override if surprise_override is not None else chunk_teach_norm
+                )
+                total_surprise += chunk_surprise * (chunk_tokens.size(1) - 1)
+                (loss / grad_accum_steps).backward()
                 with torch.no_grad():
                     if per_layer_teach:
                         base_model(
@@ -589,13 +846,23 @@ def run_training_loop(
                             fast_state=fast_state,
                         )
                     if hasattr(base_model, "pop_update_metrics"):
-                        update_metrics = base_model.pop_update_metrics()
+                        chunk_metrics = base_model.pop_update_metrics()
+                        for key, value in chunk_metrics.items():
+                            if isinstance(value, (int, float)):
+                                update_metrics[key] = update_metrics.get(key, 0.0) + float(value)
+                            else:
+                                update_metrics[key] = value
                 total_loss += loss.item() * (chunk_tokens.size(1) - 1)
                 total_tokens += chunk_tokens.size(1) - 1
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if should_step_optimizer:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps_total += 1
+                micro_steps_since_optimizer_step = 0
             loss = torch.tensor(total_loss / max(total_tokens, 1), device=device)
             teach_signal_norm = teach_signal_norm / max(total_tokens, 1)
+            surprise_value_for_step = total_surprise / max(total_tokens, 1)
         else:
             with autocast_factory():
                 if per_layer_teach and hasattr(base_model, "forward_with_block_outputs"):
@@ -623,12 +890,15 @@ def run_training_loop(
                 tokens=tokens,
                 loss=loss,
             )
-            optimizer.zero_grad()
             if per_layer_teach and hasattr(base_model, "forward_with_block_outputs"):
                 teach_signals = _compute_layer_teach_signals(loss, block_outputs)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
-            optimizer.step()
+            (loss / grad_accum_steps).backward()
+            if should_step_optimizer:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps_total += 1
+                micro_steps_since_optimizer_step = 0
             with torch.no_grad():
                 if per_layer_teach and hasattr(base_model, "forward_with_block_outputs"):
                     teach_signal_norm = float(
@@ -641,7 +911,12 @@ def run_training_loop(
                         fast_state=fast_state,
                     )
                 else:
-                    teach_signal = compute_teach_signal(base_model, logits, tokens)
+                    teach_signal = compute_teach_signal(
+                        base_model,
+                        logits,
+                        tokens,
+                        normalization=teach_signal_normalization,
+                    )
                     teach_signal_norm = teach_signal.norm(dim=-1).mean().item()
                     base_model(
                         tokens,
@@ -651,21 +926,38 @@ def run_training_loop(
                     )
                 if hasattr(base_model, "pop_update_metrics"):
                     update_metrics = base_model.pop_update_metrics()
+            surprise_value_for_step = (
+                surprise_override if surprise_override is not None else teach_signal_norm
+            )
         if step % log_interval == 0:
-            ppl = torch.exp(loss.detach()).item()
+            ppl = _safe_perplexity(loss)
             metrics_payload = {
                 "loss": loss.item(),
                 "ppl": ppl,
                 "teach_signal_norm": teach_signal_norm,
+                "surprise_metric": surprise_metric,
+                "surprise_value": surprise_value_for_step,
+                "tokens_seen_total": tokens_seen_total,
+                "tokens_per_step": tokens_this_step,
+                "batch_size": int(tokens.size(0)),
+                "seq_len": int(tokens.size(1)),
+                "optimizer_steps_total": optimizer_steps_total,
+                "grad_accum_steps": grad_accum_steps,
             }
             metrics_payload.update(update_metrics)
+            if fast_state is not None:
+                metrics_payload.update(_fast_state_metrics(fast_state))
             logger.log(metrics_payload, step=step)
-            if (not distributed) or (dist_ctx and dist_ctx.rank == 0):
+            if not isinstance(logger, NullLogger) and (
+                (not distributed) or (dist_ctx and dist_ctx.rank == 0)
+            ):
                 print(
                     f"[train] step={step} loss={loss.item():.4f} "
                     f"ppl={ppl:.2f} teach_norm={teach_signal_norm:.4f}"
                 )
             metrics = metrics_payload
+        if step_end_callback is not None:
+            step_end_callback(step)
         maybe_save_checkpoint(
             cfg,
             base_model,
@@ -678,6 +970,12 @@ def run_training_loop(
         )
     logger.finish()
     return metrics
+
+
+def _safe_perplexity(loss: torch.Tensor, max_value: float = 1.0e38) -> float:
+    """Convert CE loss to perplexity while preventing float overflows in telemetry."""
+    clamped_loss = min(float(loss.detach().double().item()), math.log(max_value))
+    return float(min(math.exp(clamped_loss), max_value))
 
 
 def _apply_teach_schedule(model: HOPEModel, cfg: DictConfig, step: int) -> None:
@@ -844,7 +1142,9 @@ def _build_muon_optimizer(
         muon_kwargs["ns_coefficients"] = tuple(ns_coefficients)
     if ns_steps is not None:
         muon_kwargs["ns_steps"] = int(ns_steps)
-    muon_opt = torch.optim.Muon(muon_params, **muon_kwargs) if muon_params else None  # type: ignore[attr-defined]
+    muon_opt = (
+        torch.optim.Muon(muon_params, **muon_kwargs) if muon_params else None
+    )  # type: ignore[attr-defined]
     adamw_kwargs = {
         "lr": lr,
         "betas": optimizer_cfg.get("betas", (0.9, 0.999)),
@@ -960,7 +1260,7 @@ def _is_memory_param_name(name: str) -> bool:
 
 
 def _is_muon_candidate(name: str, param: torch.nn.Parameter) -> bool:
-    if param.ndim < 2:
+    if param.ndim != 2:
         return False
     lowered = name.lower()
     if "norm" in lowered or "embed" in lowered:
@@ -986,11 +1286,11 @@ class _HybridOptimizer:
         self.primary_name = primary_name
         self.param_policy = param_policy
 
-    def zero_grad(self) -> None:
+    def zero_grad(self, set_to_none: bool = False) -> None:
         if self.primary_opt:
-            self.primary_opt.zero_grad()
+            self.primary_opt.zero_grad(set_to_none=set_to_none)
         if self.secondary_opt:
-            self.secondary_opt.zero_grad()
+            self.secondary_opt.zero_grad(set_to_none=set_to_none)
 
     def step(self) -> None:
         if self.primary_opt:
@@ -1043,6 +1343,12 @@ def _log_run_features(
         "attention.flash_enabled": _detect_flash_attention(model),
         "device": device.type,
     }
+    surprise_metric_getter = getattr(model, "get_surprise_metric", None)
+    surprise_threshold_getter = getattr(model, "get_surprise_threshold", None)
+    if callable(surprise_metric_getter):
+        features["model.surprise_metric"] = str(surprise_metric_getter())
+    if callable(surprise_threshold_getter):
+        features["model.surprise_threshold"] = surprise_threshold_getter()
     optimizer_cfg_raw = cfg.get("optim")
     if isinstance(optimizer_cfg_raw, DictConfig):
         optimizer_cfg = optimizer_cfg_raw
