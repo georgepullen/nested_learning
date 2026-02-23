@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import torch
+
+from nested_learning.levels import LevelSpec
+from nested_learning.model import HOPEModel, ModelConfig
+from nested_learning.training import compute_teach_signal
+
+
+def _tiny_hybrid_config() -> ModelConfig:
+    titan = LevelSpec(name="titan", update_period=1, optimizer_key="titan_opt")
+    cms = [
+        LevelSpec(name="cms_fast", update_period=1, optimizer_key="cms_opt"),
+        LevelSpec(name="cms_mid", update_period=2, optimizer_key="cms_opt"),
+    ]
+    return ModelConfig(
+        vocab_size=64,
+        dim=32,
+        num_layers=1,
+        heads=4,
+        block_variant="hope_hybrid",
+        titan_level=titan,
+        cms_levels=cms,
+        optimizers=None,
+        teach_scale=0.1,
+    )
+
+
+def _sample_cms_deltas(state, sample_idx: int) -> dict[str, dict[str, torch.Tensor]]:
+    block = state.blocks[0]
+    out: dict[str, dict[str, torch.Tensor]] = {}
+    for level_name, store in block.cms_params.items():
+        if isinstance(store, list):
+            out[level_name] = {name: value.detach().clone() for name, value in store[sample_idx].items()}
+        else:
+            out[level_name] = {
+                name: value[sample_idx].detach().clone() for name, value in store.items()
+            }
+    return out
+
+
+def _titan_checksum(state, sample_idx: int) -> float:
+    block = state.blocks[0]
+    titan = block.titan_params
+    if titan is None:
+        return 0.0
+    if isinstance(titan, list):
+        params = titan[sample_idx]
+    else:
+        params = {k: v[sample_idx] for k, v in titan.items()}
+    total = 0.0
+    for idx, (_, value) in enumerate(sorted(params.items())):
+        total += float((idx + 1) * value.detach().float().mean().item())
+    return total
+
+
+def test_tensorized_cms_hybrid_wiring_matches_listmode() -> None:
+    torch.manual_seed(29)
+    model = HOPEModel(_tiny_hybrid_config())
+    # Force CMS-only updates so hybrid wiring is exercised while titan updates are disabled.
+    model.set_allowed_update_levels({"cms_fast", "cms_mid"})
+    tokens = torch.randint(0, model.config.vocab_size, (3, 14))
+
+    list_state = model.init_fast_state(batch_size=tokens.size(0), fast_state_batch_mode="per_sample_list")
+    tensor_state = model.init_fast_state(
+        batch_size=tokens.size(0),
+        fast_state_batch_mode="tensorized_cms",
+    )
+
+    titan_before_list = [_titan_checksum(list_state, i) for i in range(tokens.size(0))]
+    titan_before_tensor = [_titan_checksum(tensor_state, i) for i in range(tokens.size(0))]
+
+    with torch.no_grad():
+        logits_list = model(tokens, fast_state=list_state)
+        teach_list = compute_teach_signal(model, logits_list, tokens, normalization="per_sample")
+        _ = model(tokens, teach_signal=teach_list, fast_state=list_state)
+        logits_after_list = model(tokens, fast_state=list_state)
+
+        logits_tensor = model(tokens, fast_state=tensor_state)
+        teach_tensor = compute_teach_signal(model, logits_tensor, tokens, normalization="per_sample")
+        _ = model(tokens, teach_signal=teach_tensor, fast_state=tensor_state)
+        logits_after_tensor = model(tokens, fast_state=tensor_state)
+
+    diff = (logits_after_list - logits_after_tensor).abs().float()
+    assert diff.mean().item() < 8e-2
+    assert diff.max().item() < 7e-1
+
+    for sample_idx in range(tokens.size(0)):
+        list_deltas = _sample_cms_deltas(list_state, sample_idx)
+        tensor_deltas = _sample_cms_deltas(tensor_state, sample_idx)
+        assert list_deltas.keys() == tensor_deltas.keys()
+        for level_name in list_deltas:
+            assert list_deltas[level_name].keys() == tensor_deltas[level_name].keys()
+            for param_name in list_deltas[level_name]:
+                assert torch.allclose(
+                    list_deltas[level_name][param_name],
+                    tensor_deltas[level_name][param_name],
+                    atol=7e-4,
+                    rtol=7e-4,
+                )
+
+    titan_after_list = [_titan_checksum(list_state, i) for i in range(tokens.size(0))]
+    titan_after_tensor = [_titan_checksum(tensor_state, i) for i in range(tokens.size(0))]
+    for before, after in zip(titan_before_list, titan_after_list, strict=True):
+        assert abs(before - after) <= 1e-7
+    for before, after in zip(titan_before_tensor, titan_after_tensor, strict=True):
+        assert abs(before - after) <= 1e-7
