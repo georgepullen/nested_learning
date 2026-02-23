@@ -1,0 +1,84 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+model:
+  vocab_size: 32000
+  dim: 256
+  num_layers: 4
+  heads: 8
+  teach_scale: 0.1
+  teach_clip: 5.0
+  block_variant: hope_hybrid
+  titan_level:
+    name: titan
+    update_period: 8
+    optimizer_key: titan_opt
+  cms_levels:
+    - name: cms_fast
+      update_period: 1
+      optimizer_key: cms_opt
+    - name: cms_mid
+      update_period: 4
+      optimizer_key: cms_opt
+    - name: cms_slow
+      update_period: 16
+      optimizer_key: cms_opt
+  optimizers:
+    titan_opt:
+      type: deep_momentum
+      lr: 6.0e-4
+      params:
+        beta: 0.9
+        beta2: 0.999
+    cms_opt:
+      type: deep_momentum
+      lr: 3.0e-4
+      params:
+        beta: 0.9
+        beta2: 0.999
+
+data:
+  source: synthetic
+  vocab_size: 32000
+  seq_len: 128
+  dataset_size: 4096
+  batch_size: 1
+  num_workers: 0
+
+train:
+  online_updates: true
+  online_chunk_size: 2
+  per_layer_teach_signal: false
+  use_fast_state: true
+  fast_state_batch_mode: shared
+  teach_signal_normalization: per_sample
+  grad_accum_steps: 1
+  steps: 2000
+  log_interval: 20
+  max_runtime_seconds: 82800
+  device: "cuda"
+  seed: 1337
+  deterministic: false
+  mixed_precision:
+    enabled: true
+    dtype: fp16
+  compile:
+    enable: false
+  checkpoint:
+    enable: false
+
+optim:
+  type: adamw
+  lr: 2.0e-4
+  weight_decay: 0.01
+  fused: auto
+
+logging:
+  enabled: true
+  backend: json
+  path: logs/bench_small_b1_metrics.json
+  run_name: bench-small-b1

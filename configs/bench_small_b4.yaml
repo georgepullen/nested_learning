@@ -1,0 +1,20 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+defaults:
+  - /bench_small_b1
+  - _self_
+
+data:
+  batch_size: 4
+
+train:
+  fast_state_batch_mode: per_sample_list
+
+logging:
+  path: logs/bench_small_b4_metrics.json
+  run_name: bench-small-b4

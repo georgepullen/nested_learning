@@ -1,0 +1,29 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+defaults:
+  - /bench_small_b4
+  - _self_
+
+model:
+  dim: 384
+  num_layers: 6
+  heads: 8
+
+data:
+  seq_len: 256
+  dataset_size: 8192
+
+train:
+  steps: 200
+  log_interval: 10
+  max_runtime_seconds: 3600
+  online_chunk_size: 2
+
+logging:
+  path: logs/bench_micro_medium_metrics.json
+  run_name: bench-micro-medium

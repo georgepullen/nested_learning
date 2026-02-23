@@ -35,6 +35,41 @@ jobs:
       - name: Pytest
         run: uv run pytest
 
+      - name: Fidelity telemetry validator fixtures
+        run: |
+          uv run python scripts/checks/validate_fidelity_telemetry.py \
+            --log tests/data/telemetry/passing_metrics.json
+          if uv run python scripts/checks/validate_fidelity_telemetry.py \
+            --log tests/data/telemetry/failing_missing_layer_metrics.json; then
+            echo "Expected telemetry validator to fail on missing layer metrics."
+            exit 1
+          fi
+
+      - name: Optional throughput regression guard (GPU artifacts)
+        env:
+          PERF_GUARD_DIR: ${{ vars.PERF_GUARD_DIR }}
+        run: |
+          if [ -z "${PERF_GUARD_DIR:-}" ]; then
+            echo "Skipping optional throughput guard; set repository variable PERF_GUARD_DIR to enable."
+            exit 0
+          fi
+          for req in \
+            bench_medium_shared_b1.json \
+            bench_medium_per_sample_list_b4.json \
+            bench_medium_tensorized_cms_b4.json; do
+            if [ ! -f "${PERF_GUARD_DIR}/${req}" ]; then
+              echo "Missing throughput artifact: ${PERF_GUARD_DIR}/${req}"
+              exit 1
+            fi
+          done
+          uv run python scripts/checks/validate_throughput_gate.py \
+            --label "ci-medium" \
+            --b1-json "${PERF_GUARD_DIR}/bench_medium_shared_b1.json" \
+            --list-json "${PERF_GUARD_DIR}/bench_medium_per_sample_list_b4.json" \
+            --tensorized-json "${PERF_GUARD_DIR}/bench_medium_tensorized_cms_b4.json" \
+            --min-list-ratio 1.45 \
+            --min-b1-ratio 1.8
+
   cpu-ddp-smoke:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,19 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+defaults:
+  - /bench_small_b4
+  - _self_
+
+train:
+  steps: 200
+  log_interval: 10
+  max_runtime_seconds: 3600
+
+logging:
+  path: logs/bench_micro_200_metrics.json
+  run_name: bench-micro-200

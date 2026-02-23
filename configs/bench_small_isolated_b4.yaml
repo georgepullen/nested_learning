@@ -1,0 +1,18 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+defaults:
+  - /bench_small_b4
+  - _self_
+
+train:
+  steps: 2000
+  max_runtime_seconds: 82800
+
+logging:
+  path: logs/bench_small_isolated_b4_metrics.json
+  run_name: bench-small-isolated-b4
