@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from ..backbones import AttentionConfig, SelfAttention
 from ..cms import CMS
-from ..fast_state import BlockFastState
+from ..fast_state import AttentionKVCache, BlockFastState
 from ..functional import (
     call_with_batched_deltas,
     call_with_deltas,
@@ -332,8 +332,19 @@ class HOPEAttentionBlock(nn.Module):
         teach_signal: torch.Tensor | None = None,
         surprise_value: float | None = None,
         fast_state: BlockFastState | None = None,
-    ) -> torch.Tensor:
-        attn_out = self.attn(x)
+        finalize_updates: bool = True,
+        attention_cache: AttentionKVCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, AttentionKVCache | None]:
+        _ = (finalize_updates, differentiable_updates)
+        next_attention_cache: AttentionKVCache | None = None
+        if return_attention_cache:
+            attn_out, next_attention_cache = self.attn(
+                x, kv_cache=attention_cache, return_kv_cache=True
+            )
+        else:
+            attn_out = self.attn(x, kv_cache=attention_cache)
         if fast_state is None:
             if teach_signal is not None and self.config.cms_online_updates:
                 cms_out = self._cms_forward_online(attn_out, teach_signal, surprise_value)
@@ -343,6 +354,8 @@ class HOPEAttentionBlock(nn.Module):
                 if teach_signal is not None:
                     self._update_cms(cms_inputs, cms_outputs, teach_signal, surprise_value)
             self.level_manager.tick()
+            if return_attention_cache:
+                return cms_out, next_attention_cache
             return cms_out
         if teach_signal is not None and self.config.cms_online_updates:
             cms_out = self._cms_forward_online_fast(
@@ -353,6 +366,8 @@ class HOPEAttentionBlock(nn.Module):
             if teach_signal is not None:
                 self._update_cms_fast(fast_state, cms_inputs, teach_signal, surprise_value)
         _tick_manager(fast_state.level_manager)
+        if return_attention_cache:
+            return cms_out, next_attention_cache
         return cms_out
 
     def set_surprise_threshold(self, threshold: float | None) -> None:
@@ -908,7 +923,15 @@ class HOPESelfModBlock(nn.Module):
         teach_signal: torch.Tensor | None = None,
         surprise_value: float | None = None,
         fast_state: BlockFastState | None = None,
-    ) -> torch.Tensor:
+        finalize_updates: bool = True,
+        attention_cache: AttentionKVCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, AttentionKVCache | None]:
+        _ = (finalize_updates, differentiable_updates)
+        if attention_cache is not None:
+            raise RuntimeError("attention_cache is not supported for hope_selfmod blocks")
+        next_attention_cache: AttentionKVCache | None = None
         if fast_state is None:
             # Differentiable read path (used for the outer loss).
             o = self.selfmod(x)
@@ -922,6 +945,8 @@ class HOPESelfModBlock(nn.Module):
                 if teach_signal is not None:
                     self._update_cms(cms_inputs, cms_outputs, teach_signal, surprise_value)
             self.level_manager.tick()
+            if return_attention_cache:
+                return cms_out, next_attention_cache
             return cms_out
 
         if fast_state.selfmod_state is None:
@@ -958,6 +983,8 @@ class HOPESelfModBlock(nn.Module):
             if teach_signal is not None:
                 self._update_cms_fast(fast_state, cms_inputs, teach_signal, surprise_value)
         _tick_manager(fast_state.level_manager)
+        if return_attention_cache:
+            return cms_out, next_attention_cache
         return cms_out
 
     def set_surprise_threshold(self, threshold: float | None) -> None:
@@ -1481,8 +1508,19 @@ class HOPEBlock(nn.Module):
         teach_signal: torch.Tensor | None = None,
         surprise_value: float | None = None,
         fast_state: BlockFastState | None = None,
-    ) -> torch.Tensor:
-        attn_out = self.attn(x)
+        finalize_updates: bool = True,
+        attention_cache: AttentionKVCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, AttentionKVCache | None]:
+        _ = (finalize_updates, differentiable_updates)
+        next_attention_cache: AttentionKVCache | None = None
+        if return_attention_cache:
+            attn_out, next_attention_cache = self.attn(
+                x, kv_cache=attention_cache, return_kv_cache=True
+            )
+        else:
+            attn_out = self.attn(x, kv_cache=attention_cache)
         if fast_state is None:
             mem_out = self.titan_memory(attn_out)
             combined = attn_out + mem_out
@@ -1496,6 +1534,8 @@ class HOPEBlock(nn.Module):
                     self._update_titan(attn_out, mem_out, teach_signal, surprise_value)
                     self._update_cms(cms_inputs, cms_outputs, teach_signal, surprise_value)
             self.level_manager.tick()
+            if return_attention_cache:
+                return cms_out, next_attention_cache
             return cms_out
 
         if fast_state.titan_params is None:
@@ -1518,6 +1558,8 @@ class HOPEBlock(nn.Module):
                 self._update_titan_fast(fast_state, attn_out, mem_out, teach_signal, surprise_value)
                 self._update_cms_fast(fast_state, cms_inputs, teach_signal, surprise_value)
         _tick_manager(fast_state.level_manager)
+        if return_attention_cache:
+            return cms_out, next_attention_cache
         return cms_out
 
     def set_surprise_threshold(self, threshold: float | None) -> None:

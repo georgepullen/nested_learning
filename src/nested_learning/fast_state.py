@@ -111,3 +111,28 @@ def build_block_fast_state(
 @dataclass
 class ModelFastState:
     blocks: list[BlockFastState]
+
+
+@dataclass
+class AttentionKVCache:
+    """
+    Per-layer autoregressive attention cache.
+
+    Shapes:
+    - key:   [batch, heads, cached_tokens, head_dim]
+    - value: [batch, heads, cached_tokens, head_dim]
+    """
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass
+class ModelAttentionCache:
+    """
+    Model-level container for per-block attention caches.
+
+    Blocks without attention store `None` entries.
+    """
+
+    blocks: list[AttentionKVCache | None]
