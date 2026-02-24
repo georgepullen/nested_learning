@@ -33,6 +33,9 @@ Use `--list-tasks` to print available options.
 Each task logs accuracy and sample count into the JSON file. Adjust
 `--max-samples` (0 = evaluate entire validation set) based on runtime.
 
+`scripts/eval/zeroshot.py` now exposes `--eval-state-mode`, but only
+`reset_per_sample` is supported for multi-choice scoring in this implementation.
+
 For reproducibility, record the checkpoint SHA, tokenizer version, 
 and command invocation alongside the JSON results.
 
@@ -96,6 +99,8 @@ uv run python scripts/eval/passkey.py \
 ```
 
 The JSON reports baseline vs. memorize accuracy, Titan/CMS update stats, the active memory paths, and the surprise threshold. Use `--memorize-paths` to restrict updates to `titan`, `cms_fast`, or any comma-separated combination, and `--memorize-surprise-threshold` to match the paper’s surprise-gated updates.
+
+For passkey/NIAH scripts, `--eval-state-mode=reset_per_sample` is currently required to avoid branch contamination between answer candidates.
 
 Note: memorization runs against a per-example fast state by default (so checkpoint weights are not mutated). If you call `memorize_sequence()` programmatically with `MemorizeConfig.use_fast_state=true`, pass a `fast_state = model.init_fast_state()` object.
 

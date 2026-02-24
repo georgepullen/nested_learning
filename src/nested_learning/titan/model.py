@@ -7,7 +7,13 @@ import torch
 import torch.nn as nn
 
 from ..backbones import AttentionConfig, SelfAttention
-from ..fast_state import BlockFastState, ModelFastState, build_block_fast_state
+from ..fast_state import (
+    AttentionKVCache,
+    BlockFastState,
+    ModelAttentionCache,
+    ModelFastState,
+    build_block_fast_state,
+)
 from ..functional import (
     call_with_deltas,
     call_with_params,
@@ -81,8 +87,20 @@ class TitanOnlyBlock(nn.Module):
         teach_signal: torch.Tensor | None = None,
         surprise_value: float | None = None,
         fast_state: BlockFastState | None = None,
-    ) -> torch.Tensor:
-        attn_out = self.attn(x)
+        attention_cache: AttentionKVCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, AttentionKVCache]:
+        _ = differentiable_updates
+        next_attn_cache: AttentionKVCache | None = None
+        if return_attention_cache:
+            attn_out, next_attn_cache = self.attn(
+                x,
+                kv_cache=attention_cache,
+                return_kv_cache=True,
+            )
+        else:
+            attn_out = self.attn(x, kv_cache=attention_cache)
         if fast_state is None:
             mem_out = self.titan_memory(attn_out)
         else:
@@ -101,7 +119,11 @@ class TitanOnlyBlock(nn.Module):
             self.level_manager.tick()
         else:
             fast_state.level_manager.tick()
-        return self.norm(combined)
+        out = self.norm(combined)
+        if return_attention_cache:
+            assert next_attn_cache is not None
+            return out, next_attn_cache
+        return out
 
     def set_surprise_threshold(self, threshold: float | None) -> None:
         self.surprise_threshold = threshold
@@ -294,7 +316,10 @@ class TitanOnlyModel(nn.Module):
         teach_signal: torch.Tensor | None = None,
         fast_state: ModelFastState | None = None,
         surprise_value: float | None = None,
-    ) -> torch.Tensor:
+        attention_cache: ModelAttentionCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ModelAttentionCache]:
         require_external = self._surprise_metric in {"loss", "logit_entropy"}
         if require_external and self._surprise_threshold is not None:
             if teach_signal is not None and surprise_value is None:
@@ -305,7 +330,10 @@ class TitanOnlyModel(nn.Module):
         x = self.embed(tokens)
         if fast_state is not None and len(fast_state.blocks) != len(self.blocks):
             raise ValueError("fast_state.blocks length does not match model.blocks")
+        if attention_cache is not None and len(attention_cache.blocks) != len(self.blocks):
+            raise ValueError("attention_cache.blocks length does not match model.blocks")
         base_surprise = surprise_value
+        next_caches: list[AttentionKVCache | None] = []
         for idx, block in enumerate(self.blocks):
             scaled_signal = None
             if teach_signal is not None:
@@ -323,14 +351,32 @@ class TitanOnlyModel(nn.Module):
             ):
                 block_surprise = float(scaled_signal.norm(dim=-1).mean().item())
             block_state = None if fast_state is None else fast_state.blocks[idx]
-            x = block(  # type: ignore[arg-type]
-                x,
-                teach_signal=scaled_signal,
-                surprise_value=block_surprise,
-                fast_state=block_state,
-            )
+            block_cache = None if attention_cache is None else attention_cache.blocks[idx]
+            if return_attention_cache:
+                x, next_cache = block(  # type: ignore[arg-type]
+                    x,
+                    teach_signal=scaled_signal,
+                    surprise_value=block_surprise,
+                    fast_state=block_state,
+                    attention_cache=block_cache,
+                    return_attention_cache=True,
+                    differentiable_updates=differentiable_updates,
+                )
+                next_caches.append(next_cache)
+            else:
+                x = block(  # type: ignore[arg-type]
+                    x,
+                    teach_signal=scaled_signal,
+                    surprise_value=block_surprise,
+                    fast_state=block_state,
+                    attention_cache=block_cache,
+                    differentiable_updates=differentiable_updates,
+                )
         x = self.norm(x)
-        return self.lm_head(x)
+        logits = self.lm_head(x)
+        if return_attention_cache:
+            return logits, ModelAttentionCache(blocks=next_caches)
+        return logits
 
     def freeze_backbone(self) -> None:
         """
@@ -361,3 +407,6 @@ class TitanOnlyModel(nn.Module):
             )
             states.append(state)
         return ModelFastState(blocks=states)
+
+    def init_attention_cache(self) -> ModelAttentionCache:
+        return ModelAttentionCache(blocks=[None for _ in self.blocks])

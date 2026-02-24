@@ -92,6 +92,34 @@ if [[ -n "${TITAN_CHECKPOINT}" ]]; then
   copy_sidecars "${TITAN_CHECKPOINT}" "${RELEASE_DIR}/titan_${TITAN_BASENAME%.pt}"
 fi
 
+summarize_train_flags() {
+  local ckpt_path="$1"
+  local meta_path="${ckpt_path%.pt}.meta.json"
+  if [[ ! -f "${meta_path}" ]]; then
+    echo "n/a"
+    return
+  fi
+  python - "$meta_path" <<'PY'
+import json, pathlib, sys
+meta = json.loads(pathlib.Path(sys.argv[1]).read_text())
+keys = [
+    ("algorithm_mode", "algorithm_mode"),
+    ("online_updates", "online_updates"),
+    ("online_boundary_targets", "online_boundary_targets"),
+    ("online_carry_attention_cache", "online_carry_attention_cache"),
+    ("use_fast_state", "use_fast_state"),
+]
+parts = [f"{label}={meta.get(key)!r}" for key, label in keys]
+print(", ".join(parts))
+PY
+}
+
+HOPE_TRAIN_FLAGS=$(summarize_train_flags "${HOPE_CHECKPOINT}")
+TITAN_TRAIN_FLAGS=""
+if [[ -n "${TITAN_CHECKPOINT}" ]]; then
+  TITAN_TRAIN_FLAGS=$(summarize_train_flags "${TITAN_CHECKPOINT}")
+fi
+
 # Update metadata stub with checkpoint information if present
 if [[ -f "${METADATA_PATH}" ]]; then
   python - "$HOPE_CHECKPOINT_BASENAME" "$TITAN_RELEASE_BASENAME" "$METADATA_PATH" <<'PY' || true
@@ -112,8 +140,10 @@ fi
   echo "Pilot Release Manifest"
   echo "======================"
   echo "HOPE Checkpoint: ${HOPE_CHECKPOINT_BASENAME}"
+  echo "HOPE Train Flags: ${HOPE_TRAIN_FLAGS}"
   if [[ -n "${TITAN_RELEASE_BASENAME}" ]]; then
     echo "TITAN Checkpoint: ${TITAN_RELEASE_BASENAME}"
+    echo "TITAN Train Flags: ${TITAN_TRAIN_FLAGS}"
   fi
   echo "Config: ${CONFIG_PATH}"
   echo "Logs copied from patterns: ${LOG_PATTERNS[*]}"

@@ -342,8 +342,17 @@ def main(
             "use 'all' to allow every path."
         ),
     ),
+    eval_state_mode: str = typer.Option(
+        "reset_per_sample",
+        help="Streaming eval state mode. Currently only 'reset_per_sample' is supported here.",
+    ),
 ) -> None:
     available = list(TASK_EVALUATORS.keys())
+    if eval_state_mode.strip().lower() not in {"reset", "isolated", "reset_per_sample"}:
+        raise typer.BadParameter(
+            "zeroshot multiple-choice scoring only supports eval_state_mode=reset_per_sample "
+            "in this implementation."
+        )
     if list_tasks:
         typer.echo("Available tasks: " + ", ".join(available))
         raise typer.Exit(0)

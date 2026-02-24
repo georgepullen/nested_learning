@@ -31,6 +31,13 @@ class ShardConfig:
     data_files: Optional[str] = None
 
 
+def _select_fallback_split(available: list[str]) -> str:
+    for candidate in ("train", "validation", "test"):
+        if candidate in available:
+            return candidate
+    return available[0]
+
+
 def shard_dataset(config: ShardConfig) -> dict:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     processor = spm.SentencePieceProcessor(model_file=str(config.tokenizer_path))
@@ -50,12 +57,11 @@ def shard_dataset(config: ShardConfig) -> dict:
         available = list(ds_dict.keys())
         if not available:
             raise
-        fallback = (
-            "train"
-            if "train" in available
-            else ("test" if "test" in available else available[0])
+        fallback = _select_fallback_split(available)
+        typer.echo(
+            f"[Shard] Requested split '{config.split}' unavailable; "
+            f"using '{fallback}' (available={available})"
         )
-        typer.echo(f"[Shard] Requested split '{config.split}' unavailable; using '{fallback}'")
         ds = ds_dict[fallback]
 
     buffer: List[int] = []

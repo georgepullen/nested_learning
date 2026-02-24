@@ -32,6 +32,15 @@ jobs:
       - name: Mypy
         run: uv run mypy src
 
+      - name: Verify docs path references
+        run: uv run python scripts/checks/verify_docs_refs.py
+
+      - name: Guard tracked file sizes / artifact extensions
+        run: bash scripts/checks/check_git_tracked_sizes.sh
+
+      - name: Verify scripts/data help exits cleanly
+        run: bash scripts/checks/check_data_script_help.sh
+
       - name: Pytest
         run: uv run pytest
 
@@ -113,3 +122,25 @@ jobs:
 
       - name: Run synthetic passkey memorization test
         run: bash scripts/tests/run_passkey_smoke.sh
+
+  fidelity-subset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.9.8"
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run fidelity subset + compliance report
+        run: bash scripts/checks/run_fidelity_ci_subset.sh

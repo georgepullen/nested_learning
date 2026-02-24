@@ -10,8 +10,13 @@ Mechanism-level reproduction of Google's Nested Learning (HOPE) architecture (HO
 Faithfulness scope (high level):
 - ✅ HOPE / CMS / Self‑Modifying Titans update rules + wiring (mechanism-level)
 - ✅ Tensor-level invariants covered by unit tests (teach-signal, δℓ, CMS chunking, causality)
-- ⚠️ Online “writes” are stop‑grad (no backprop through online updates / boundary-state training procedure)
-- ⚠️ Multi‑GPU “paper-faithful online updates” are not supported in this repo (DDP disables some features)
+- ✅ Boundary-target online chunking + optional attention-cache carry path are implemented
+- ⚠️ Stable default uses stop-grad online writes; an experimental single-process boundary-state mode supports differentiable write paths
+- ⚠️ Multi‑GPU mechanism-auditing online updates are not supported in this repo (DDP disables some features)
+
+Paper reference pin:
+- Source: `google_papers/Nested_Learning_Full_Paper/Nested_Learning_Full_Paper.md`
+- SHA-256: `7524af0724ac8e3bad9163bf0e79c85b490a26bc30b92d96b0bdf17a27f9febc`
 
 ## Quickstart
 ```bash
@@ -20,6 +25,7 @@ uv sync --all-extras
 uv run bash scripts/data/run_sample.sh
 uv run bash scripts/run_smoke.sh pilot  # CPU-friendly HOPE block smoke test
 uv run bash scripts/run_e2e_smoke.sh    # sync + sample data + smoke train + zeroshot eval
+uv run bash scripts/run_mechanism_audit_smoke.sh
 uv run python scripts/eval/zeroshot.py \
   --config configs/hope/pilot.yaml \
   --checkpoint artifacts/examples/pilot_dummy.pt \
@@ -42,6 +48,23 @@ Developer checks:
 - `uv run ruff check .`
 - `uv run mypy src`
 - `uv run pytest`
+- `uv run bash scripts/checks/run_fidelity_ci_subset.sh`
+- `uv run python scripts/checks/compliance_report.py --config configs/pilot.yaml --output eval/compliance_report.json`
+
+## First 30 Minutes
+Use this path for a fast first success on CPU:
+
+```bash
+uv sync --all-extras
+uv run bash scripts/data/run_sample.sh
+uv run bash scripts/run_smoke.sh pilot
+uv run bash scripts/run_mechanism_audit_smoke.sh
+```
+
+This confirms:
+- data/tokenizer pipeline is operational,
+- model/training loop runs end-to-end,
+- cadence checks pass for a mechanism-auditing smoke run.
 
 ## Data Pipeline
 1. **Tokenizer training**
@@ -64,9 +87,21 @@ Developer checks:
    uv run bash scripts/data/run_sample.sh
    ```
 4. **Full pipeline** (set env vars like `RW_LIMIT`, `WIKI_LIMIT`, etc. to scale ingestion)
-   ```bash
-   uv run bash scripts/data/run_full.sh  # default ~50k docs per corpus; increase limits as needed
-   ```
+  ```bash
+  uv run bash scripts/data/run_full.sh  # default ~50k docs per corpus; increase limits as needed
+  ```
+
+### Data Troubleshooting
+- If `scripts/data/run_sample.sh` cannot find `artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model`, rerun:
+  ```bash
+  uv run bash scripts/data/run_sample.sh
+  ```
+  The script auto-trains the tokenizer when missing.
+- If `scripts/data/run_full.sh` fails with `Bad split: train. Available splits: ['test']`, use split fallback:
+  ```bash
+  FALLBACK_SPLIT=test uv run bash scripts/data/run_full.sh
+  ```
+  You can also override per-corpus splits (for example `RW_SPLIT=test`).
 
 ## Training
 - Single GPU / CPU:
@@ -100,9 +135,9 @@ Developer checks:
     deepspeed.config=configs/deepspeed/zero3.json
   ```
 
-### Paper-faithful mechanisms (HOPE / Nested Learning)
+### Mechanism-auditing presets (HOPE / Nested Learning)
 
-Use the paper-faithful preset configs (single GPU):
+Use the mechanism-auditing preset configs (single GPU):
 
 ```bash
 uv run python train.py --config-name pilot_paper_faithful
@@ -113,13 +148,22 @@ uv run python train.py --config-name pilot_attention_paper_faithful
 ```
 
 Notes:
-- Paper-faithful presets set `data.batch_size=1` to avoid cross-sample fast-memory sharing.
+- These presets set `data.batch_size=1` to avoid cross-sample fast-memory sharing.
+- Online chunking supports one-token overlap **or** explicit boundary-target mode (`train.online_boundary_targets=true`).
+- Optional attention-state carry across chunks is available in training via `train.online_carry_attention_cache=true`.
+- The exact sequence/segment/chunk/buffer semantics are documented in `docs/STREAMING_CONTRACT.md`.
 
 Overrides:
 - `optim.type=m3` (paper optimizer option)
 - `train.steps=...` / `train.device=...`
 
 See `docs/PAPER_COMPLIANCE.md` for full fidelity notes.
+See `docs/STREAMING_CONTRACT.md` for the precise streaming/update contract used by this repo.
+
+## Scope Boundaries (Current)
+- This repo targets mechanism-auditing fidelity, not full paper-scale results parity.
+- Boundary-state gradient-through-write exists as an experimental constrained path; it is not yet treated as production/full-scale paper reproduction.
+- Distributed mechanism-auditing path for boundary-target + attention-cache carry is not implemented.
 
 Phase-0 canonical baseline orchestration (train + eval + bundle/checksums):
 
@@ -225,6 +269,8 @@ In-context updates can run against a per-context fast state so meta parameters n
 ## Releases
 Before tagging or announcing a new checkpoint, work through `docs/release_checklist.md` so the bundle includes manifest validation reports, tokenizer coverage JSON, zero-shot/NIAH/continual/passkey/PG-19 eval outputs, forgetting plots, and filled checkpoint reports.
 
+For reproducibility bug reports, use `docs/BUG_REPORT_CHECKLIST.md`.
+
 ## Performance & optimizer options
 - **Mixed precision:** enable bf16 autocast via `train.mixed_precision.enabled=true train.mixed_precision.dtype=bf16` (already enabled in pilot/mid/target configs).
 - **`torch.compile`:** accelerate attention/core loops by toggling `train.compile.enable=true train.compile.mode=max-autotune`; failure falls back to eager unless `train.compile.strict=true`.
@@ -235,14 +281,16 @@ Before tagging or announcing a new checkpoint, work through `docs/release_checkl
 All Hydra knobs can be overridden from the CLI or composed via config groups (`configs/hope/*.yaml`). Use these flags in tandem with `scripts/run_e2e_smoke.sh` (automation) or `scripts/run_cpu_ddp_smoke.sh` (CPU-only determinism check) to validate releases quickly.
 
 ## Documentation & References
-- `docs/guide.md` – full onboarding (setup → data → training → eval).
-- `docs/release_plan.md` – release readiness checklist.
+- `docs/IMPLEMENTATION_STATUS.md` – current mechanism-level status matrix.
+- `docs/PAPER_COMPLIANCE.md` – equation-to-code fidelity notes and explicit boundaries.
+- `docs/STREAMING_CONTRACT.md` – exact sequence/segment/chunk/update semantics.
+- `docs/release_checklist.md` – release readiness checklist.
 - `docs/data_pipeline.md` – large-scale sharding/tokenizer workflow.
 - `docs/scaling_guidance.md` – roadmap for expanding data + compute footprints.
-- `docs/stage1_plan.md`, `docs/stage2_plan.md` – architecture + experiment roadmaps.
-- `docs/stage2_progress.md` – latest dual-GPU training/eval status and commands.
+- `docs/stage2_plan.md` – Stage 2 architecture + experiment roadmap.
+- `docs/PHASE_2_PLAN.md` – detailed Phase 2 execution plan.
+- `docs/PLAN_PROGRESS_P7.md` – progress tracker for the latest faithfulness remediation sprint.
 - `docs/experiments_report.md` – draft paper covering completed experiments.
-- `docs/stability_journal.md` – chronological notes on NaN fixes & teach-scale tuning.
 - `docs/future_directions.md` – prioritized roadmap after the initial release.
 - `reports/stage2_smoke.md` – exact commands/artifacts for the release-ready smoke workflow.
 - `docs/FSDP_SCALING_GUIDE.md` – dual-RTX 6000 Ada instructions for the mid/target FSDP configs.
@@ -251,5 +299,5 @@ All Hydra knobs can be overridden from the CLI or composed via config groups (`c
 
 ## Contributing
 1. Run formatting/tests (`uv run ruff check .`, `uv run pytest`).
-2. Document new configs or scripts in `docs/guide.md` and update `CHANGELOG.md`.
-3. Open a PR referencing the relevant NL/TITAN spec sections or planner transcript snippets.
+2. Document new configs or scripts in the relevant docs under `docs/` and update `CHANGELOG.md`.
+3. Open a PR referencing the relevant NL/TITAN spec sections and tests.

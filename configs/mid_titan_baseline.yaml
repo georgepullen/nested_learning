@@ -56,8 +56,11 @@ data:
         weight: 0.1
 
 train:
+  strict_streaming_contract: false
   online_updates: true
   online_chunk_size: 0
+  online_boundary_targets: false
+  online_carry_attention_cache: false
   per_layer_teach_signal: true
   steps: 220
   log_interval: 20

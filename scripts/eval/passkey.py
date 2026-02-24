@@ -83,7 +83,16 @@ def main(
             "use 'all' for unrestricted paths."
         ),
     ),
+    eval_state_mode: str = typer.Option(
+        "reset_per_sample",
+        help="Streaming eval state mode. Currently only 'reset_per_sample' is supported here.",
+    ),
 ) -> None:
+    if eval_state_mode.strip().lower() not in {"reset", "isolated", "reset_per_sample"}:
+        raise typer.BadParameter(
+            "Passkey binary-choice scoring currently supports "
+            "eval_state_mode=reset_per_sample only."
+        )
     torch_device = resolve_device(device)
     model = load_model(config, checkpoint, torch_device)
     tokenizer = SentencePieceTokenizer(tokenizer_path)

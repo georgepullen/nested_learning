@@ -7,12 +7,15 @@ Use this list before tagging/publishing any checkpoint bundle.
 - [ ] Inner optimizer variant (`nl_l2_precond`) enabled in configs
 - [ ] Teach-signal log shows finite norms across recent steps
 - [ ] CMS chunk telemetry confirms expected update cadence
-- [ ] For RunPod jobs: `bash scripts/compute/runpod_resume_drill.sh` completed at least once on the active pod image
+- [ ] Run `uv run python scripts/checks/verify_update_cadence.py --log-path <json_log> --metric-prefix <layerN.cms.level> --total-tokens <T> --update-period <C> [--flush-partial] --output reports/cadence_<run>.json`
+- [ ] Run `uv run python scripts/checks/compliance_report.py --config <config.yaml> --cadence-report reports/cadence_<run>.json --output reports/compliance_<run>.json`
+- [ ] Run `uv run python scripts/checks/verify_docs_refs.py` (prevents doc/code reference drift)
 - [ ] `bash scripts/run_cpu_ddp_smoke.sh` (CPU DDP determinism)
 - [ ] `bash scripts/tests/run_passkey_smoke.sh` (synthetic memorization)
 
 ## Artifacts
 - [ ] Checkpoint `.pt` + `.yaml` + `.meta.json` (with tokenizer hash) in `artifacts/...`
+- [ ] Checkpoint `.meta.json` includes `algorithm_mode` + online flags (`online_updates`, `online_boundary_targets`, `online_carry_attention_cache`, `use_fast_state`)
 - [ ] Tokenizer model + checksum JSON included
 - [ ] Eval JSON/CSV (zero-shot, NIAH, continual) appended to `eval/`
 - [ ] Checkpoint report filled from `docs/templates/checkpoint_report.md`
@@ -29,11 +32,12 @@ Use this list before tagging/publishing any checkpoint bundle.
 - [ ] W&B run link recorded in report
 - [ ] Local JSON logs copied to `logs/`
 - [ ] Memorizations stats (surprise counts, Titan/CMS updates) summarized
-- [ ] `uv run python scripts/checks/validate_fidelity_telemetry.py --log <metrics.json>` passes for every release run log
 
 ## Distribution
 - [ ] README references any new scripts/configs
 - [ ] Issue templates / release notes updated if new features shipped
 - [ ] (Optional) Outreach draft added to `docs/POSTS.md`
+- [ ] Release manifest records algorithm mode + online flags for packaged checkpoints
+- [ ] Run `bash scripts/checks/check_git_tracked_sizes.sh` before push/tag (prevents large binaries/artifact extensions from being tracked)
 
 Check these boxes before pushing tags or announcing new checkpoints so collaborators can reproduce results confidently.

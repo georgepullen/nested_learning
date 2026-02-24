@@ -6,6 +6,8 @@ Use `scripts/eval/continual.py` to quantify forgetting across streaming segments
 - `--checkpoints`: ordered list of checkpoint paths (chronological training steps).
 - `--segments-yaml`: YAML describing segment names + shard directories (see `configs/data/continual_segments_sample.yaml`).
 - `--batch-size`, `--max-batches`: evaluation throughput controls (0 = entire shard).
+- `--eval-state-mode`: `reset_per_sample` (default) or `carry_across_samples`.
+- `--eval-use-fast-state` / `--eval-use-attention-cache`: enable inference-time streaming state carry semantics.
 
 Example:
 ```bash
@@ -14,6 +16,8 @@ uv run python scripts/eval/continual.py \
   --checkpoints checkpoints/mid/step_000050.pt checkpoints/mid/step_000100.pt \
   --segments-yaml configs/data/continual_segments_sample.yaml \
   --batch-size 4 --max-batches 20 \
+  --eval-state-mode carry_across_samples \
+  --eval-use-attention-cache \
   --memorize --memorize-steps 2 \
   --memorize-paths titan,cms_fast \
   --memorize-surprise-threshold 0.02 \

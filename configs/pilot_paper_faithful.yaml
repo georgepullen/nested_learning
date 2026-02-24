@@ -3,6 +3,8 @@ defaults:
   - _self_
 
 model:
+  # Explicit paper-defined variant (avoid inheriting repo default `hope_hybrid`).
+  block_variant: hope_attention
   # Paper-faithful: treat "surprise" as the (scaled) teach signal itself, without threshold gating.
   surprise_threshold: null
   # Paper updates on the last (possibly partial) chunk; enable flush for non-multiple seq lengths.
@@ -18,8 +20,16 @@ data:
   batch_size: 1
 
 train:
+  algorithm_mode: two_pass_stopgrad_updates
+  # Keep this explicit (instead of inherited) so paper-faithful behavior is visible in one file.
+  online_updates: true
   # Paper: re-initialize fast memories per context (sequence).
   use_fast_state: true
+  strict_streaming_contract: true
+  # Use explicit boundary-token supervision (no overlap approximation).
+  online_boundary_targets: true
+  # Carry attention state across chunks during online updates.
+  online_carry_attention_cache: true
   # Fail fast if DDP would silently disable paper-critical features.
   fail_if_paper_faithful_disabled: true
 

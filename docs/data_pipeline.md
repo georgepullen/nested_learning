@@ -107,6 +107,16 @@ This iterates over each dataset entry (either streamed from HF or the filtered l
 ## 3. Legacy pilot data
 - `data/shards/tinystories_train/` retains 1,718 shards for unit tests and smoke runs.
 
+## Troubleshooting Matrix
+
+| Symptom | Likely cause | Deterministic fix |
+|---|---|---|
+| `run_sample.sh` cannot find `artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model` | Tokenizer has not been trained yet | Re-run `uv run bash scripts/data/run_sample.sh`; it auto-trains tokenizer when missing |
+| `Bad split: train. Available splits: ['test']` | Dataset exposes a non-`train` split | Use fallback (`FALLBACK_SPLIT=test uv run bash scripts/data/run_full.sh`) or set per-source split env vars like `RW_SPLIT=test` |
+| `Bad split` in tokenizer/shard/filter scripts | Requested split absent in source dataset | Built-in fallback now resolves in order `train -> validation -> test -> first available` and logs available splits |
+| SentencePiece fails to hit requested vocab size on tiny corpora | `hard_vocab_limit=true` with too little data | Use `--no-hard-vocab-limit` for sample runs; keep hard limit for large production corpora |
+| Tokenizer coverage regresses between runs | Different corpus sample or tokenizer settings | Run `scripts/data/check_tokenizer_coverage.py` and `scripts/checks/tokenizer_coverage_guard.py` against baseline JSON |
+
 ## 4. Filtering & deduplication
 Before sharding full-scale corpora, run language filtering + dedup to keep only high-quality English segments:
 

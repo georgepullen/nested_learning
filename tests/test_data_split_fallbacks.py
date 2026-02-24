@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from scripts.data import shard_corpus, train_tokenizer
+from scripts.data import filter_corpus, shard_corpus, train_tokenizer
 
 
 def test_train_tokenizer_manifest_supports_text_data_files(tmp_path: Path) -> None:
@@ -110,3 +110,17 @@ def test_train_tokenizer_allows_small_corpus_with_no_hard_vocab_limit(tmp_path: 
     )
     assert (out_dir / "spm_1000_unigram.model").exists()
     assert log_file.exists()
+
+
+def test_split_fallback_prefers_validation_then_test() -> None:
+    available = ["test", "validation"]
+    assert train_tokenizer._select_fallback_split(available) == "validation"  # noqa: SLF001
+    assert shard_corpus._select_fallback_split(available) == "validation"  # noqa: SLF001
+    assert filter_corpus._select_fallback_split(available) == "validation"  # noqa: SLF001
+
+
+def test_split_fallback_uses_first_when_no_standard_split() -> None:
+    available = ["dev", "holdout"]
+    assert train_tokenizer._select_fallback_split(available) == "dev"  # noqa: SLF001
+    assert shard_corpus._select_fallback_split(available) == "dev"  # noqa: SLF001
+    assert filter_corpus._select_fallback_split(available) == "dev"  # noqa: SLF001

@@ -26,6 +26,13 @@ class DatasetSpec:
     data_files: str | None = None
 
 
+def _select_fallback_split(available: list[str]) -> str:
+    for candidate in ("train", "validation", "test"):
+        if candidate in available:
+            return candidate
+    return available[0]
+
+
 def _load_specs_from_manifest(manifest: Path) -> List[DatasetSpec]:
     data = yaml.safe_load(manifest.read_text())
     entries = data.get("datasets", data)
@@ -61,14 +68,10 @@ def _write_samples(spec: DatasetSpec, handle) -> int:
         available = list(ds_dict.keys())
         if not available:
             raise
-        fallback = (
-            "train"
-            if "train" in available
-            else ("test" if "test" in available else available[0])
-        )
+        fallback = _select_fallback_split(available)
         typer.echo(
             f"[Tokenizer] Requested split '{spec.split}' unavailable for {spec.dataset}; "
-            f"using '{fallback}'"
+            f"using '{fallback}' (available={available})"
         )
         ds = ds_dict[fallback]
     count = 0

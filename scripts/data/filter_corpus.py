@@ -18,6 +18,13 @@ app = typer.Typer(
 )
 
 
+def _select_fallback_split(available: list[str]) -> str:
+    for candidate in ("train", "validation", "test"):
+        if candidate in available:
+            return candidate
+    return available[0]
+
+
 def normalize_text(text: str) -> str:
     return " ".join(text.strip().split())
 
@@ -74,12 +81,11 @@ def main(
         available = list(ds_dict.keys())
         if not available:
             raise
-        fallback = (
-            "train"
-            if "train" in available
-            else ("test" if "test" in available else available[0])
+        fallback = _select_fallback_split(available)
+        typer.echo(
+            f"[Filter] Requested split '{split}' unavailable; "
+            f"using '{fallback}' (available={available})"
         )
-        typer.echo(f"[Filter] Requested split '{split}' unavailable; using '{fallback}'")
         dataset_obj = ds_dict[fallback]
     iterator = dataset_obj if streaming else iter(dataset_obj)
     seen_hashes = set()

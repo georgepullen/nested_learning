@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from .backbones import AttentionConfig, SelfAttention
+from .fast_state import AttentionKVCache
 
 
 @dataclass
@@ -78,9 +79,20 @@ class TransformerBlock(nn.Module):
         teach_signal: torch.Tensor | None = None,
         surprise_value: float | None = None,
         fast_state=None,
-    ) -> torch.Tensor:
-        _ = (teach_signal, surprise_value, fast_state)
-        return self.mlp(self.attn(x))
+        finalize_updates: bool = True,
+        attention_cache: AttentionKVCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, AttentionKVCache]:
+        _ = (teach_signal, surprise_value, fast_state, finalize_updates, differentiable_updates)
+        if return_attention_cache:
+            attn_out, next_cache = self.attn(
+                x,
+                kv_cache=attention_cache,
+                return_kv_cache=True,
+            )
+            return self.mlp(attn_out), next_cache
+        return self.mlp(self.attn(x, kv_cache=attention_cache))
 
     def set_surprise_threshold(self, threshold: float | None) -> None:
         _ = threshold

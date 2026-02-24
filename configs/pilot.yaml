@@ -46,6 +46,7 @@ model:
       params:
         beta: 0.9
         beta2: 0.999
+        # Best-effort paper mapping: rank-1 context projection preconditioner.
         variant: nl_l2_precond
     cms_opt:
       type: deep_momentum
@@ -53,6 +54,7 @@ model:
       params:
         beta: 0.9
         beta2: 0.999
+        # Best-effort paper mapping: rank-1 context projection preconditioner.
         variant: nl_l2_precond
 
 data:
@@ -81,8 +83,12 @@ data:
         weight: 0.1
 
 train:
+  algorithm_mode: two_pass_stopgrad_updates
+  strict_streaming_contract: false
   online_updates: true
   online_chunk_size: 0
+  online_boundary_targets: false
+  online_carry_attention_cache: false
   per_layer_teach_signal: true
   steps: 246667
   log_interval: 50

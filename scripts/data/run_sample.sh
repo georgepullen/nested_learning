@@ -1,10 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/data/run_sample.sh [TOKENIZER_MODEL_PATH]
+
+Builds a small filtered corpus sample, trains a tokenizer if missing, and shards it.
+
+Args:
+  TOKENIZER_MODEL_PATH  Optional tokenizer model path.
+                        Default: artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 1 ]]; then
+  usage
+  exit 2
+fi
+
 TOKENIZER_MODEL=${1:-artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model}
-TOKENIZER_DIR="$(dirname "${TOKENIZER_MODEL}")"
-RPJ_DATASET=${RPJ_DATASET:-cerebras/SlimPajama-627B}
-RPJ_DATASET_CANDIDATES=${RPJ_DATASET_CANDIDATES:-MBZUAI-LLM/SlimPajama-627B-DC,DKYoon/SlimPajama-6B,gmongaras/SlimPajama-627B_Reupload}
+TOKENIZER_DIR="$(dirname -- "${TOKENIZER_MODEL}")"
 
 if [[ ! -f "data/filtered/refinedweb_en_sample.txt" ]]; then
   echo "[Data] Creating filtered RefinedWeb sample"
@@ -49,38 +69,17 @@ fi
 
 if [[ ! -f "data/filtered/redpajama_en_sample.txt" ]]; then
   echo "[Data] Creating filtered SlimPajama sample"
-  IFS=',' read -r -a _rpj_fallbacks <<< "${RPJ_DATASET_CANDIDATES}"
-  _rpj_sources=("${RPJ_DATASET}")
-  for _fallback in "${_rpj_fallbacks[@]}"; do
-    _fallback="${_fallback//[[:space:]]/}"
-    [[ -n "${_fallback}" ]] && _rpj_sources+=("${_fallback}")
-  done
-
-  _rpj_ok=0
-  for _dataset in "${_rpj_sources[@]}"; do
-    echo "[Data] SlimPajama candidate: ${_dataset}"
-    rm -f data/filtered/redpajama_en_sample.txt
-    if uv run python scripts/data/filter_corpus.py \
-      "--dataset=${_dataset}" \
-      --split train \
-      --text-column text \
-      --target-lang en \
-      --lang-threshold 0.85 \
-      --min-chars 200 \
-      --max-chars 8000 \
-      --limit 1000 \
-      --output-path data/filtered/redpajama_en_sample.txt \
-      --force-exit; then
-      _rpj_ok=1
-      break
-    fi
-  done
-
-  if [[ "${_rpj_ok}" != "1" ]]; then
-    echo "[Data] ERROR: unable to fetch SlimPajama sample from any configured source."
-    echo "[Data] Tried: ${_rpj_sources[*]}"
-    exit 1
-  fi
+  uv run python scripts/data/filter_corpus.py \
+    "--dataset=cerebras/SlimPajama-627B" \
+    --split train \
+    --text-column text \
+    --target-lang en \
+    --lang-threshold 0.85 \
+    --min-chars 200 \
+    --max-chars 8000 \
+    --limit 1000 \
+    --output-path data/filtered/redpajama_en_sample.txt \
+    --force-exit
 fi
 
 if [[ ! -f "data/filtered/code_en_sample.txt" ]]; then

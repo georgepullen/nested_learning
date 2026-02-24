@@ -79,7 +79,15 @@ def main(
     memorize_surprise_threshold: float = typer.Option(
         None, help="Minimum teach-signal norm required before memorizing an excerpt."
     ),
+    eval_state_mode: str = typer.Option(
+        "reset_per_sample",
+        help="Streaming eval state mode. Currently only 'reset_per_sample' is supported here.",
+    ),
 ) -> None:
+    if eval_state_mode.strip().lower() not in {"reset", "isolated", "reset_per_sample"}:
+        raise typer.BadParameter(
+            "PG-19 script currently supports eval_state_mode=reset_per_sample only."
+        )
     torch_device = resolve_device(device)
     model = load_model(config, checkpoint, torch_device)
     tokenizer = SentencePieceTokenizer(tokenizer_path)

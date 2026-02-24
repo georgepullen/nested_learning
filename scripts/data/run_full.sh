@@ -1,6 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/data/run_full.sh
+
+Runs the full data pipeline:
+  1) filter configured datasets
+  2) train tokenizer (unless present)
+  3) shard filtered corpora
+
+Controls are provided via environment variables (see script header defaults).
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 0 ]]; then
+  usage
+  exit 2
+fi
+
 # General controls
 TOKENIZER_MANIFEST=${TOKENIZER_MANIFEST:-configs/data/refinedweb_mixture.yaml}
 TOKENIZER_OUTPUT_DIR=${TOKENIZER_OUTPUT_DIR:-artifacts/tokenizer/refinedweb_mix}

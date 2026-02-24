@@ -7,7 +7,12 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from .fast_state import ModelFastState, build_block_fast_state
+from .fast_state import (
+    AttentionKVCache,
+    ModelAttentionCache,
+    ModelFastState,
+    build_block_fast_state,
+)
 from .hope.block import (
     HOPEAttentionBlock,
     HOPEAttentionBlockConfig,
@@ -217,13 +222,40 @@ class HOPEModel(nn.Module):
         teach_signals: list[torch.Tensor] | None = None,
         fast_state: ModelFastState | None = None,
         surprise_value: float | None = None,
-    ) -> torch.Tensor:
-        logits, _pre_norm = self.forward_with_pre_norm(
-            tokens,
-            teach_signal=teach_signal,
-            teach_signals=teach_signals,
-            fast_state=fast_state,
-            surprise_value=surprise_value,
+        finalize_updates: bool = True,
+        attention_cache: ModelAttentionCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ModelAttentionCache]:
+        if return_attention_cache:
+            logits, _pre_norm, next_attention_cache = cast(
+                tuple[torch.Tensor, torch.Tensor, ModelAttentionCache],
+                self.forward_with_pre_norm(
+                    tokens,
+                    teach_signal=teach_signal,
+                    teach_signals=teach_signals,
+                    fast_state=fast_state,
+                    surprise_value=surprise_value,
+                    finalize_updates=finalize_updates,
+                    attention_cache=attention_cache,
+                    return_attention_cache=True,
+                    differentiable_updates=differentiable_updates,
+                ),
+            )
+            return logits, next_attention_cache
+        logits, _pre_norm = cast(
+            tuple[torch.Tensor, torch.Tensor],
+            self.forward_with_pre_norm(
+                tokens,
+                teach_signal=teach_signal,
+                teach_signals=teach_signals,
+                fast_state=fast_state,
+                surprise_value=surprise_value,
+                finalize_updates=finalize_updates,
+                attention_cache=attention_cache,
+                return_attention_cache=False,
+                differentiable_updates=differentiable_updates,
+            ),
         )
         return logits
 
@@ -235,19 +267,51 @@ class HOPEModel(nn.Module):
         teach_signals: list[torch.Tensor] | None = None,
         fast_state: ModelFastState | None = None,
         surprise_value: float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self._run_blocks(
-            tokens,
-            teach_signal=teach_signal,
-            teach_signals=teach_signals,
-            fast_state=fast_state,
-            surprise_value=surprise_value,
-        )
+        finalize_updates: bool = True,
+        attention_cache: ModelAttentionCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, ModelAttentionCache]
+    ):
+        if return_attention_cache:
+            x, next_attention_caches = cast(
+                tuple[torch.Tensor, list[AttentionKVCache | None]],
+                self._run_blocks(
+                    tokens,
+                    teach_signal=teach_signal,
+                    teach_signals=teach_signals,
+                    fast_state=fast_state,
+                    surprise_value=surprise_value,
+                    finalize_updates=finalize_updates,
+                    attention_cache=attention_cache,
+                    return_attention_cache=True,
+                    differentiable_updates=differentiable_updates,
+                ),
+            )
+        else:
+            x = cast(
+                torch.Tensor,
+                self._run_blocks(
+                    tokens,
+                    teach_signal=teach_signal,
+                    teach_signals=teach_signals,
+                    fast_state=fast_state,
+                    surprise_value=surprise_value,
+                    finalize_updates=finalize_updates,
+                    attention_cache=attention_cache,
+                    return_attention_cache=False,
+                    differentiable_updates=differentiable_updates,
+                ),
+            )
         pre_norm = cast(torch.Tensor, x)
         x = self.norm(pre_norm)
         logits = self.lm_head(x)
         if teach_signal is not None or teach_signals is not None:
             self._latest_update_metrics = self._gather_block_stats()
+        if return_attention_cache:
+            return logits, pre_norm, ModelAttentionCache(blocks=next_attention_caches)
         return logits, pre_norm
 
     def forward_with_block_outputs(
@@ -258,20 +322,58 @@ class HOPEModel(nn.Module):
         teach_signals: list[torch.Tensor] | None = None,
         fast_state: ModelFastState | None = None,
         surprise_value: float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
-        x, block_outputs = self._run_blocks(
-            tokens,
-            teach_signal=teach_signal,
-            teach_signals=teach_signals,
-            fast_state=fast_state,
-            surprise_value=surprise_value,
-            collect_outputs=True,
-        )
+        finalize_updates: bool = True,
+        attention_cache: ModelAttentionCache | None = None,
+        return_attention_cache: bool = False,
+        differentiable_updates: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], ModelAttentionCache]
+    ):
+        if return_attention_cache:
+            x, block_outputs, next_attention_caches = cast(
+                tuple[torch.Tensor, list[torch.Tensor], list[AttentionKVCache | None]],
+                self._run_blocks(
+                    tokens,
+                    teach_signal=teach_signal,
+                    teach_signals=teach_signals,
+                    fast_state=fast_state,
+                    surprise_value=surprise_value,
+                    finalize_updates=finalize_updates,
+                    attention_cache=attention_cache,
+                    return_attention_cache=True,
+                    collect_outputs=True,
+                    differentiable_updates=differentiable_updates,
+                ),
+            )
+        else:
+            x, block_outputs = cast(
+                tuple[torch.Tensor, list[torch.Tensor]],
+                self._run_blocks(
+                    tokens,
+                    teach_signal=teach_signal,
+                    teach_signals=teach_signals,
+                    fast_state=fast_state,
+                    surprise_value=surprise_value,
+                    finalize_updates=finalize_updates,
+                    attention_cache=attention_cache,
+                    return_attention_cache=False,
+                    collect_outputs=True,
+                    differentiable_updates=differentiable_updates,
+                ),
+            )
         pre_norm = x
         x = self.norm(x)
         logits = self.lm_head(x)
         if teach_signal is not None or teach_signals is not None:
             self._latest_update_metrics = self._gather_block_stats()
+        if return_attention_cache:
+            return (
+                logits,
+                pre_norm,
+                block_outputs,
+                ModelAttentionCache(blocks=next_attention_caches),
+            )
         return logits, pre_norm, block_outputs
 
     def _run_blocks(
@@ -282,10 +384,20 @@ class HOPEModel(nn.Module):
         fast_state: ModelFastState | None,
         teach_signals: list[torch.Tensor] | None = None,
         surprise_value: float | None = None,
+        finalize_updates: bool = True,
+        attention_cache: ModelAttentionCache | None = None,
+        return_attention_cache: bool = False,
         collect_outputs: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        differentiable_updates: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, list[AttentionKVCache | None]]
+        | tuple[torch.Tensor, list[torch.Tensor], list[AttentionKVCache | None]]
+    ):
         x = self.embed(tokens)
         block_outputs: list[torch.Tensor] = []
+        next_attention_caches: list[AttentionKVCache | None] = []
         runtime_scale = self._runtime_teach_scale
         runtime_clip = self._runtime_teach_clip
         if teach_signals is not None:
@@ -298,6 +410,8 @@ class HOPEModel(nn.Module):
                 raise ValueError("Provide either teach_signal or teach_signals, not both.")
         if fast_state is not None and len(fast_state.blocks) != len(self.blocks):
             raise ValueError("fast_state.blocks length does not match model.blocks")
+        if attention_cache is not None and len(attention_cache.blocks) != len(self.blocks):
+            raise ValueError("attention_cache.blocks length does not match model.blocks")
 
         require_external = self._surprise_metric in {"loss", "logit_entropy"}
         if require_external and self._surprise_threshold is not None:
@@ -319,6 +433,7 @@ class HOPEModel(nn.Module):
 
         for idx, block in enumerate(self.blocks):
             block_state = None if fast_state is None else fast_state.blocks[idx]
+            block_attention_cache = None if attention_cache is None else attention_cache.blocks[idx]
             scaled_signal = None
             block_surprise = base_surprise
             if teach_signal is not None:
@@ -356,22 +471,44 @@ class HOPEModel(nn.Module):
                 sig=scaled_signal,
                 st=block_state,
                 sv=block_surprise,
+                fin=finalize_updates,
+                ac=block_attention_cache,
+                du=differentiable_updates,
             ) -> torch.Tensor:
                 return blk(
                     hidden,
                     teach_signal=sig,
                     surprise_value=sv,
                     fast_state=st,
+                    finalize_updates=fin,
+                    attention_cache=ac,
+                    differentiable_updates=du,
                 )
 
-            if torch.is_grad_enabled() and self.training and self.gradient_checkpointing:
+            if return_attention_cache:
+                x, next_cache = block(  # type: ignore[assignment]
+                    x,
+                    teach_signal=scaled_signal,
+                    surprise_value=block_surprise,
+                    fast_state=block_state,
+                    finalize_updates=finalize_updates,
+                    attention_cache=block_attention_cache,
+                    return_attention_cache=True,
+                    differentiable_updates=differentiable_updates,
+                )
+                next_attention_caches.append(next_cache)
+            elif torch.is_grad_enabled() and self.training and self.gradient_checkpointing:
                 x = checkpoint(block_call, x, use_reentrant=False)
             else:
                 x = block_call(x)
             if collect_outputs:
                 block_outputs.append(x)
+        if collect_outputs and return_attention_cache:
+            return x, block_outputs, next_attention_caches
         if collect_outputs:
             return x, block_outputs
+        if return_attention_cache:
+            return x, next_attention_caches
         return x
 
     def _gather_block_stats(self) -> Dict[str, float]:
@@ -450,6 +587,9 @@ class HOPEModel(nn.Module):
             else:
                 raise TypeError(f"Unsupported block type for fast state: {type(block)}")
         return ModelFastState(blocks=states)
+
+    def init_attention_cache(self) -> ModelAttentionCache:
+        return ModelAttentionCache(blocks=[None for _ in self.blocks])
 
     def freeze_backbone(self) -> None:
         """
